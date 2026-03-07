@@ -1,0 +1,8 @@
+.streamlit/secrets.toml
+portfolio.json
+signals.json
+advice_log.json
+dashboard_password.txt
+__pycache__/
+*.pyc
+.env
