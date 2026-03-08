@@ -160,6 +160,7 @@ def market_status() -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _lock            = threading.Lock()
+_scan_lock       = threading.Lock()   # voorkomt gelijktijdige scan-runs
 _watcher_started = False
 
 
@@ -450,6 +451,17 @@ def run_scan() -> list:
     Stuurt Telegram-alerts voor portfolio-posities met KOOP/VERKOOP signaal.
     Geeft lijst van signalen terug (gesorteerd op RSI).
     """
+    # Voorkom dat twee threads tegelijk scannen (knop + achtergrond-thread)
+    if not _scan_lock.acquire(blocking=False):
+        return []   # al bezig — stil weggaan
+    try:
+        return _run_scan_inner()
+    finally:
+        _scan_lock.release()
+
+
+def _run_scan_inner() -> list:
+    """Interne scan-logica — aanroepen via run_scan() (heeft de lock)."""
     try:
         raw = yf.download(
             WATCHLIST, period="3mo", interval="1d",
