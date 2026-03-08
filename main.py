@@ -178,12 +178,15 @@ def load_portfolio() -> dict:
                 return json.loads(PORTFOLIO_FILE.read_text())
             except Exception:
                 pass
-    # Default startersportfolio — pas buy_date aan via Transacties zodra exacte datum bekend is
+    # Werkelijk portfolio — exacte posities per 2025-03-08
     _now = datetime.now().isoformat()
     return {
-        "MRCY": {"shares": 4.3835,  "avg_price": 89.43,  "buy_date": "2024-09-01", "added": _now},
-        "NVDA": {"shares": 0.1245,  "avg_price": 121.50, "buy_date": "2024-11-01", "added": _now},
-        "PLTR": {"shares": 5.0000,  "avg_price": 24.10,  "buy_date": "2024-10-01", "added": _now},
+        "MRCY": {"shares": 4.38356102, "avg_price": 89.43, "buy_date": "2024-09-01",
+                 "added": _now, "status": "ACTIEF"},
+        "ARRY": {"shares": 13.00,      "avg_price": 6.81,  "buy_date": "2025-03-08",
+                 "added": _now, "status": "PENDING"},
+        "FUBO": {"shares": 11.00,      "avg_price": 1.18,  "buy_date": "2025-03-08",
+                 "added": _now, "status": "PENDING"},
     }
 
 
@@ -639,34 +642,42 @@ def _run_scan_inner() -> list:
             save_last_signals(last_signals)
             continue
 
-        # ── Portfolio-positie: alleen VERKOOP-alert (RSI > 70 OF winst > 8%) ─
+        # ── Portfolio-positie: PENDING = stil; ACTIEF = VERKOOP bij RSI > 70 ───
         if ticker in portfolio:
-            pos       = portfolio[ticker]
-            rsi_val   = sig.get("rsi") or 0
-            cur_price = sig.get("price") or 0
-            avg_price = float(pos.get("avg_price") or 0)
+            pos    = portfolio[ticker]
+            status = pos.get("status", "ACTIEF")
+
+            # PENDING-posities: nooit alerteren (order nog niet uitgevoerd)
+            if status != "ACTIEF":
+                continue
+
+            rsi_val    = sig.get("rsi") or 0
+            cur_price  = sig.get("price") or 0
+            avg_price  = float(pos.get("avg_price") or 0)
             profit_pct = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
-            should_sell = rsi_val > 70 or profit_pct > 8
+
+            # Verkoop-trigger: ALLEEN RSI > 70 (overbought) voor actieve posities
+            should_sell = rsi_val > 70
 
             if should_sell and not _recently_alerted(ticker, "VERKOOP"):
                 pnl_usd     = (cur_price - avg_price) * float(pos.get("shares", 0))
-                sell_reason = (
-                    f"RSI overbought ({rsi_val:.0f})"
-                    if rsi_val > 70
-                    else f"Winst +{profit_pct:.1f}% (profit taking)"
-                )
+                sell_reason = f"RSI overbought ({rsi_val:.0f})"
                 markt = (
                     "⏸ Markt gesloten — uitvoering bij opening"
                     if not ms["is_open"]
                     else "⬤ Markt open"
                 )
 
-                # Top-3 alternatieven buiten portfolio met RSI < 35
+                # Top-3 alternatieven: prijs ≥ $5, trend omhoog (prijs > SMA-200)
                 alts = [
                     s for s in results
                     if s["ticker"] not in portfolio
                     and (s.get("rsi") or 100) < 35
-                    and s.get("price")
+                    and (s.get("price") or 0) >= 5.0
+                    and (
+                        s.get("sma200") is None          # onvoldoende data → benefit of doubt
+                        or (s.get("price") or 0) > (s.get("sma200") or 0)
+                    )
                 ][:3]
 
                 msg = (
@@ -678,7 +689,7 @@ def _run_scan_inner() -> list:
                     f"{markt}"
                 )
                 if alts:
-                    msg += "\n\n\U0001f4a1 <b>Alternatieven (oversold RSI &lt; 35):</b>"
+                    msg += "\n\n\U0001f4a1 <b>Alternatieven (↑ trend, RSI &lt; 35):</b>"
                     for alt in alts:
                         msg += f"\n• <b>{alt['ticker']}</b> — RSI: {alt['rsi']} · ${alt['price']:.2f}"
 
@@ -1056,26 +1067,36 @@ if page == "Portfolio & P&L":
     prices  = fetch_quotes(tuple(sorted(tickers)))
 
     # ── Samenvatting ─────────────────────────────────────────────────────────
+    # PENDING-posities tellen mee in waarde, maar NIET in P&L
+    _actief   = [t for t in tickers if portfolio[t].get("status", "ACTIEF") == "ACTIEF"]
+    _pending  = [t for t in tickers if portfolio[t].get("status", "ACTIEF") != "ACTIEF"]
+
     total_cost  = sum(portfolio[t]["shares"] * portfolio[t]["avg_price"] for t in tickers)
     total_value = sum(
         portfolio[t]["shares"] * (prices.get(t) or portfolio[t]["avg_price"])
         for t in tickers
     )
-    total_pnl     = total_value - total_cost
-    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost else 0
+    # P&L alleen over ACTIEVE posities
+    pnl_cost  = sum(portfolio[t]["shares"] * portfolio[t]["avg_price"] for t in _actief)
+    pnl_value = sum(
+        portfolio[t]["shares"] * (prices.get(t) or portfolio[t]["avg_price"])
+        for t in _actief
+    )
+    total_pnl     = pnl_value - pnl_cost
+    total_pnl_pct = (total_pnl / pnl_cost * 100) if pnl_cost else 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Totale Waarde",    f"${total_value:,.2f}")
     c2.metric("Kosten Basis",     f"${total_cost:,.2f}")
     c3.metric("Unrealized P&L",   f"${total_pnl:+,.2f}", f"{total_pnl_pct:+.1f}%")
-    c4.metric("Posities",         len(tickers))
+    c4.metric("Posities",         f"{len(_actief)} actief  ·  {len(_pending)} pending" if _pending else str(len(tickers)))
 
     st.divider()
 
     # ── Snelle transactie toevoegen ───────────────────────────────────────────
     with st.expander("➕ Snelle Transactie Toevoegen", expanded=False):
         with st.form("quick_add_portfolio", clear_on_submit=True):
-            qc1, qc2, qc3, qc4 = st.columns(4)
+            qc1, qc2, qc3, qc4, qc5 = st.columns(5)
             with qc1:
                 qt = st.text_input("Ticker (bijv. AAPL)").strip().upper()
             with qc2:
@@ -1084,6 +1105,8 @@ if page == "Portfolio & P&L":
                 qp = st.number_input("Prijs ($)", min_value=0.0, step=0.01, format="%.2f", value=0.0)
             with qc4:
                 qd = st.date_input("Aankoopdatum", value=date.today())
+            with qc5:
+                qs = st.selectbox("Status", ["ACTIEF", "PENDING"])
             if st.form_submit_button("+ Toevoegen aan Portfolio", use_container_width=True):
                 if qt and qa > 0 and qp > 0:
                     if qt in portfolio:
@@ -1098,10 +1121,11 @@ if page == "Portfolio & P&L":
                             "avg_price": round(qp, 4),
                             "buy_date":  qd.isoformat(),
                             "added":     datetime.now().isoformat(),
+                            "status":    qs,
                         }
                     save_portfolio(portfolio)
                     fetch_quotes.clear()
-                    st.success(f"✓ {qt}: {qa:.4f} aandelen @ ${qp:.2f} opgeslagen.")
+                    st.success(f"✓ {qt}: {qa:.4f} aandelen @ ${qp:.2f} [{qs}] opgeslagen.")
                     st.rerun()
                 else:
                     st.error("Vul ticker, aantal (> 0) en prijs (> 0) in.")
@@ -1114,7 +1138,9 @@ if page == "Portfolio & P&L":
         current_price = prices.get(ticker)
         hist          = fetch_history(ticker, "1mo")
 
-        with st.expander(f"**{ticker}** — {pos['shares']} aandelen", expanded=True):
+        _pos_status  = pos.get("status", "ACTIEF")
+        _status_tag  = "  ⏳ PENDING" if _pos_status == "PENDING" else ""
+        with st.expander(f"**{ticker}** — {pos['shares']} aandelen{_status_tag}", expanded=True):
             col_chart, col_stats = st.columns([3, 1])
 
             with col_chart:
@@ -1182,11 +1208,19 @@ if page == "Portfolio & P&L":
 
             with col_stats:
                 if current_price and not hist.empty:
-                    pnl_usd      = (current_price - pos["avg_price"]) * pos["shares"]
-                    pnl_pct      = ((current_price - pos["avg_price"]) / pos["avg_price"]) * 100
+                    _status        = pos.get("status", "ACTIEF")
+                    _is_pending    = _status == "PENDING"
                     huidige_waarde = current_price * pos["shares"]
-                    sig_data     = compute_signal(hist["Close"].squeeze())
-                    signal       = sig_data.get("signal", "?")
+                    sig_data       = compute_signal(hist["Close"].squeeze())
+                    signal         = sig_data.get("signal", "?")
+
+                    # P&L: toon $0.00 voor PENDING (order nog niet bevestigd)
+                    if _is_pending:
+                        pnl_usd = 0.0
+                        pnl_pct = 0.0
+                    else:
+                        pnl_usd = (current_price - pos["avg_price"]) * pos["shares"]
+                        pnl_pct = ((current_price - pos["avg_price"]) / pos["avg_price"]) * 100
 
                     # Dagen in bezit
                     _buy_str = pos.get("buy_date") or pos.get("added", "")
@@ -1197,15 +1231,28 @@ if page == "Portfolio & P&L":
                         _dagen = 0
 
                     badge_map = {"BUY": "buy", "SELL": "sell", "HOLD": "hold"}
-                    label_map = {"BUY": "BIJKOPEN", "SELL": "VERKOPEN", "HOLD": "VASTHOUDEN"}
-                    badge_cls = badge_map.get(signal, "hold")
-                    label     = label_map.get(signal, signal)
-                    pnl_cls   = "pnl-pos" if pnl_usd >= 0 else "pnl-neg"
+                    # PENDING-posities tonen altijd "IN AFWACHTING" badge
+                    if _is_pending:
+                        badge_cls = "hold"
+                        label     = "IN AFWACHTING"
+                    else:
+                        label_map = {"BUY": "BIJKOPEN", "SELL": "VERKOPEN", "HOLD": "VASTHOUDEN"}
+                        badge_cls = badge_map.get(signal, "hold")
+                        label     = label_map.get(signal, signal)
+                    pnl_cls = "pnl-pos" if pnl_usd >= 0 else "pnl-neg"
+
+                    _pnl_display = (
+                        '<div style="font-size:.72rem;color:#fb923c;font-style:italic">'
+                        'Wacht op marktopening —<br>berekening start bij eerste koersbeweging.</div>'
+                        if _is_pending
+                        else f'<div class="{pnl_cls}">${pnl_usd:+.2f} ({pnl_pct:+.1f}%)</div>'
+                    )
 
                     st.markdown(f"""
                     <div class="card">
                         <div style="margin-bottom:12px">
                             <span class="badge-{badge_cls}">{label}</span>
+                            {"&nbsp;<span style='font-size:.65rem;color:#fb923c;font-weight:600'>⏳ PENDING</span>" if _is_pending else ""}
                         </div>
                         <div style="font-size:.7rem;color:#64748b">Huidige prijs</div>
                         <div style="font-size:1.3rem;font-weight:800;color:#f1f5f9">${current_price:.2f}</div>
@@ -1216,7 +1263,7 @@ if page == "Portfolio & P&L":
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Aandelen</div>
                         <div style="color:#94a3b8">{pos['shares']}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Totale winst/verlies</div>
-                        <div class="{pnl_cls}">${pnl_usd:+.2f} ({pnl_pct:+.1f}%)</div>
+                        {_pnl_display}
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Dagen in bezit</div>
                         <div style="color:#94a3b8">{_dagen} dagen</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">RSI (14)</div>
@@ -1703,7 +1750,7 @@ elif page == "Transacties":
     # ── Positie toevoegen / wijzigen ─────────────────────────────────────────
     st.markdown("### Positie Toevoegen of Wijzigen")
     with st.form("add_position"):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             new_ticker = st.text_input("Ticker (bijv. NVDA)").strip().upper()
         with c2:
@@ -1714,6 +1761,8 @@ elif page == "Transacties":
                                          value=0.0, step=0.01, format="%.2f")
         with c4:
             new_date   = st.date_input("Aankoopdatum", value=date.today())
+        with c5:
+            new_status = st.selectbox("Status", ["ACTIEF", "PENDING"])
         if st.form_submit_button("Opslaan", use_container_width=True):
             if new_ticker and new_shares > 0 and new_price > 0:
                 if new_ticker in portfolio:
@@ -1728,10 +1777,11 @@ elif page == "Transacties":
                         "avg_price": new_price,
                         "buy_date":  new_date.isoformat(),
                         "added":     datetime.now().isoformat(),
+                        "status":    new_status,
                     }
                 save_portfolio(portfolio)
                 fetch_quotes.clear()
-                st.success(f"✓ {new_ticker}: {new_shares} aandelen @ ${new_price:.2f} opgeslagen.")
+                st.success(f"✓ {new_ticker}: {new_shares} aandelen @ ${new_price:.2f} [{new_status}] opgeslagen.")
                 st.rerun()
             else:
                 st.error("Vul alle velden correct in (ticker, aandelen > 0, prijs > 0).")
@@ -1779,9 +1829,11 @@ elif page == "Transacties":
         for ticker in list(portfolio.keys()):
             pos = portfolio[ticker]
 
-            with st.expander(f"**{ticker}** — {pos['shares']} aandelen @ ${pos['avg_price']:.4f}", expanded=False):
+            _edit_status = pos.get("status", "ACTIEF")
+            _tag = "  ⏳ PENDING" if _edit_status == "PENDING" else ""
+            with st.expander(f"**{ticker}** — {pos['shares']} aandelen @ ${pos['avg_price']:.4f}{_tag}", expanded=False):
                 with st.form(f"edit_{ticker}"):
-                    ec1, ec2, ec3 = st.columns(3)
+                    ec1, ec2, ec3, ec4 = st.columns(4)
                     with ec1:
                         edit_shares = st.number_input(
                             "Totaal aantal aandelen",
@@ -1805,6 +1857,10 @@ elif page == "Transacties":
                         except Exception:
                             _bd_default = date.today()
                         edit_date = st.date_input("Aankoopdatum", value=_bd_default)
+                    with ec4:
+                        _status_idx = 0 if _edit_status == "ACTIEF" else 1
+                        edit_status = st.selectbox("Status", ["ACTIEF", "PENDING"],
+                                                   index=_status_idx)
 
                     sb1, sb2 = st.columns([2, 1])
                     with sb1:
@@ -1813,9 +1869,10 @@ elif page == "Transacties":
                                 portfolio[ticker]["shares"]    = round(edit_shares, 8)
                                 portfolio[ticker]["avg_price"] = round(edit_price, 4)
                                 portfolio[ticker]["buy_date"]  = edit_date.isoformat()
+                                portfolio[ticker]["status"]    = edit_status
                                 save_portfolio(portfolio)
                                 fetch_quotes.clear()
-                                st.success(f"✓ {ticker} bijgewerkt: {edit_shares} aandelen @ ${edit_price:.4f}")
+                                st.success(f"✓ {ticker} bijgewerkt: {edit_shares} aandelen @ ${edit_price:.4f} [{edit_status}]")
                                 st.rerun()
                             else:
                                 st.error("Aandelen en prijs moeten groter zijn dan 0.")
