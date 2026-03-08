@@ -1408,16 +1408,23 @@ if page == "Portfolio & P&L":
                     st.warning(f"Geen historische data beschikbaar voor {ticker}.")
 
             with col_stats:
-                if current_price and not hist.empty:
+                # Stats card heeft hist NIET nodig — alleen de chart doet dat.
+                # Gebruik avg_price als fallback wanneer live koers nog niet beschikbaar is.
+                _display_price = current_price or pos["avg_price"]
+                if _display_price:
                     _status        = pos.get("status", "ACTIEF")
                     _is_pending    = _status == "PENDING"
-                    huidige_waarde = current_price * pos["shares"]
+                    huidige_waarde = _display_price * pos["shares"]
                     # Prefer stored scan result (uses 1y data) over recomputing from 1mo hist
                     _stored_sig = load_last_signals().get(ticker, {})
                     if _stored_sig and _stored_sig.get("signal") not in (None, "DATA_ERROR", "?"):
                         sig_data = _stored_sig
-                    else:
+                    elif not hist.empty:
                         sig_data = compute_signal(hist["Close"].squeeze())
+                    else:
+                        sig_data = {"signal": "DATA_ERROR", "rsi": None,
+                                    "upper_bb": None, "lower_bb": None}
+                    current_price = _display_price  # gebruik fallback voor verdere berekeningen
                     signal         = sig_data.get("signal", "?")
 
                     # P&L: toon $0.00 voor PENDING (order nog niet bevestigd)
@@ -1585,7 +1592,7 @@ if page == "Portfolio & P&L":
                             unsafe_allow_html=True,
                         )
                 else:
-                    st.warning("Prijsdata niet beschikbaar.")
+                    st.caption("Koersdata nog niet beschikbaar — wordt geladen bij volgende refresh.")
 
             # ── Verkopen sectie (onder chart + stats) ────────────────────────
             st.markdown(
