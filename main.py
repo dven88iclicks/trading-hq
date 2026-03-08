@@ -175,13 +175,12 @@ def load_portfolio() -> dict:
                 return json.loads(PORTFOLIO_FILE.read_text())
             except Exception:
                 pass
-    # Default: jouw huidige MRCY-positie
+    # Default startersportfolio — pas buy_date aan via Transacties zodra exacte datum bekend is
+    _now = datetime.now().isoformat()
     return {
-        "MRCY": {
-            "shares":    4.38356102,
-            "avg_price": 89.43,
-            "added":     datetime.now().isoformat(),
-        }
+        "MRCY": {"shares": 4.3835,  "avg_price": 89.43,  "buy_date": "2024-09-01", "added": _now},
+        "NVDA": {"shares": 0.1245,  "avg_price": 121.50, "buy_date": "2024-11-01", "added": _now},
+        "PLTR": {"shares": 5.0000,  "avg_price": 24.10,  "buy_date": "2024-10-01", "added": _now},
     }
 
 
@@ -378,14 +377,14 @@ def forecast_48h(close: pd.Series) -> dict:
 
 def compute_signal(close: pd.Series) -> dict:
     """
-    Professionele signaalberekening:
-    - BUY  : RSI < 30  ÉN prijs ≤ onderste Bollinger Band  (beide voorwaarden)
-    - SELL : RSI > 70  ÉN prijs ≥ bovenste Bollinger Band  (beide voorwaarden)
-    - HOLD : alles daartussenin
-    Beide voorwaarden tegelijk = significante technische bevestiging.
+    Professionele signaalberekening met kwaliteitsfilters:
+    - BUY  : RSI < 30 ÉN prijs ≤ onderste BB (2σ) ÉN prijs boven SMA-200 ÉN prijs ≥ $5
+    - SELL : RSI > 70 ÉN prijs ≥ bovenste BB  (beide voorwaarden — exit via scanner)
+    - HOLD : alles daartussenin of filters niet gehaald
     """
     if len(close) < 20:
-        return {"signal": "DATA_ERROR", "rsi": None, "upper_bb": None, "lower_bb": None, "price": None}
+        return {"signal": "DATA_ERROR", "rsi": None, "upper_bb": None, "lower_bb": None,
+                "price": None, "sma200": None}
 
     current   = float(close.iloc[-1])
     rsi_val   = float(calc_rsi(close).iloc[-1])
@@ -393,7 +392,17 @@ def compute_signal(close: pd.Series) -> dict:
     upper_val = float(upper.iloc[-1])
     lower_val = float(lower.iloc[-1])
 
-    if rsi_val < 30 and current <= lower_val:
+    # SMA-200: alleen beschikbaar als we >= 200 datapunten hebben
+    _sma200_raw = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
+    sma200_val  = _sma200_raw if (_sma200_raw and not np.isnan(_sma200_raw)) else None
+
+    # Kwaliteitsfilter: geen penny stocks
+    price_ok = current >= 5.0
+
+    # Trend filter: prijs boven SMA-200 (skip als onvoldoende data)
+    trend_ok = (sma200_val is None) or (current > sma200_val)
+
+    if rsi_val < 30 and current <= lower_val and price_ok and trend_ok:
         signal = "BUY"
     elif rsi_val > 70 and current >= upper_val:
         signal = "SELL"
@@ -406,6 +415,7 @@ def compute_signal(close: pd.Series) -> dict:
         "rsi":      round(rsi_val, 1),
         "upper_bb": round(upper_val, 2),
         "lower_bb": round(lower_val, 2),
+        "sma200":   round(sma200_val, 2) if sma200_val else None,
     }
 
 
@@ -463,8 +473,9 @@ def run_scan() -> list:
 def _run_scan_inner() -> list:
     """Interne scan-logica — aanroepen via run_scan() (heeft de lock)."""
     try:
+        # 1 jaar data zodat SMA-200 berekend kan worden
         raw = yf.download(
-            WATCHLIST, period="3mo", interval="1d",
+            WATCHLIST, period="1y", interval="1d",
             group_by="ticker", progress=False, threads=True,
         )
     except Exception:
@@ -516,12 +527,12 @@ def _run_scan_inner() -> list:
     def _is_extreme(sig: dict) -> bool:
         """
         Extreem zeldzame koopkans: RSI < 15 én prijs ≥ 15% onder onderste Bollinger Band.
-        Definiëren als 'kans van verdubbelen in 24u' — wordt bijna nooit actief.
+        Kwaliteitsfilter: geen penny stocks.
         """
         rsi   = sig.get("rsi") or 50
         price = sig.get("price") or 0
         lb    = sig.get("lower_bb") or price
-        return rsi < 15 and lb > 0 and price < lb * 0.85
+        return rsi < 15 and lb > 0 and price < lb * 0.85 and price >= 5.0
 
     for sig in results:
         ticker = sig["ticker"]
@@ -534,18 +545,19 @@ def _run_scan_inner() -> list:
         prev_signal  = prev.get("signal")
         prev_alerted = prev.get("alerted", False)
 
-        # Altijd huidige stand bijwerken (sent_at alleen bij daadwerkelijk sturen)
+        # Bijwerken staat — bewaar last_telegram zodat cooldown-check blijft werken
         last_signals[ticker] = {
-            "signal":   signal,
-            "price":    sig.get("price"),
-            "updated":  now.isoformat(),
-            "sent_at":  prev.get("sent_at"),
-            "alerted":  prev_alerted,
+            "signal":        signal,
+            "price":         sig.get("price"),
+            "updated":       now.isoformat(),
+            "sent_at":       prev.get("sent_at"),
+            "alerted":       prev_alerted,
+            "last_telegram": prev.get("last_telegram"),   # NIET overschrijven
         }
 
         # ── Advies verlopen: was actief + gealerteerd, nu HOLD ───────────────
         if prev_signal in ("BUY", "SELL") and prev_alerted and signal == "HOLD":
-            if _cooldown_ok(ticker, "EXPIRED"):
+            if _cooldown_ok(ticker, "VERLOPEN"):
                 telegram_send(
                     f"⚠️ <b>Advies {ticker}: Verlopen</b> (Prijs is gestabiliseerd)\n"
                     f"RSI: {sig['rsi']}  ·  Prijs: ${sig['price']:.2f}"
@@ -558,17 +570,61 @@ def _run_scan_inner() -> list:
             save_last_signals(last_signals)
             continue
 
-        # ── Zelfde alert-type al recent verstuurd → stilte ───────────────────
-        alert_type = "KOOP" if signal == "BUY" else ("VERKOOP" if signal == "SELL" else None)
-        if alert_type and _recently_alerted(ticker, alert_type):
-            continue
+        # ── Portfolio-positie: alleen VERKOOP-alert (RSI > 70 OF winst > 8%) ─
+        if ticker in portfolio:
+            pos       = portfolio[ticker]
+            rsi_val   = sig.get("rsi") or 0
+            cur_price = sig.get("price") or 0
+            avg_price = float(pos.get("avg_price") or 0)
+            profit_pct = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
+            should_sell = rsi_val > 70 or profit_pct > 8
 
-        # ── Markt dicht + geen actief signaal → overslaan ────────────────────
+            if should_sell and not _recently_alerted(ticker, "VERKOOP"):
+                pnl_usd     = (cur_price - avg_price) * float(pos.get("shares", 0))
+                sell_reason = (
+                    f"RSI overbought ({rsi_val:.0f})"
+                    if rsi_val > 70
+                    else f"Winst +{profit_pct:.1f}% (profit taking)"
+                )
+                markt = (
+                    "⏸ Markt gesloten — uitvoering bij opening"
+                    if not ms["is_open"]
+                    else "⬤ Markt open"
+                )
+
+                # Top-3 alternatieven buiten portfolio met RSI < 35
+                alts = [
+                    s for s in results
+                    if s["ticker"] not in portfolio
+                    and (s.get("rsi") or 100) < 35
+                    and s.get("price")
+                ][:3]
+
+                msg = (
+                    f"🔴 <b>VERKOPEN: {ticker}</b>\n"
+                    f"Reden: {sell_reason}\n"
+                    f"Prijs: <b>${cur_price:.2f}</b>  ·  RSI: {rsi_val}\n"
+                    f"Positie: {pos.get('shares')} aandelen @ ${avg_price:.2f}\n"
+                    f"P&amp;L: <b>${pnl_usd:+.2f} ({profit_pct:+.1f}%)</b>\n"
+                    f"{markt}"
+                )
+                if alts:
+                    msg += "\n\n\U0001f4a1 <b>Alternatieven (oversold RSI &lt; 35):</b>"
+                    for alt in alts:
+                        msg += f"\n• <b>{alt['ticker']}</b> — RSI: {alt['rsi']} · ${alt['price']:.2f}"
+
+                telegram_send(msg)
+                last_signals[ticker].update({
+                    "alerted":       True,
+                    "sent_at":       now.isoformat(),
+                    "last_telegram": "VERKOOP",
+                })
+                save_last_signals(last_signals)
+            continue   # bot blijft stil over portfolio-posities — geen BUY-alerts
+
+        # ── Niet in portfolio — BUY/KOOPKANS logica ──────────────────────────
+        # Markt dicht + geen actief signaal → overslaan
         if not ms["is_open"] and signal not in ("BUY", "SELL"):
-            continue
-
-        # ── SELL alleen voor eigen posities ──────────────────────────────────
-        if signal == "SELL" and ticker not in portfolio:
             continue
 
         # ── BUY: budget = 0 → alleen bij extreme kans, anders stilte ─────────
@@ -585,54 +641,19 @@ def _run_scan_inner() -> list:
             save_last_signals(last_signals)
             continue
 
-        # ── Alert voor eigen portfolio-positie ───────────────────────────────
-        if ticker in portfolio and signal in ("BUY", "SELL"):
-            pos     = portfolio[ticker]
-            pnl_usd = (sig["price"] - pos["avg_price"]) * pos["shares"]
-            pnl_pct = ((sig["price"] - pos["avg_price"]) / pos["avg_price"]) * 100
-            emoji   = "🔴 VERKOPEN" if signal == "SELL" else "🟢 BIJKOPEN"
-            markt   = "⏸ Markt gesloten — uitvoering bij opening" if not ms["is_open"] else "⬤ Markt open"
-
-            msg = (
-                f"<b>{emoji}: {ticker}</b>\n"
-                f"Prijs: <b>${sig['price']:.2f}</b>\n"
-                f"RSI: {sig['rsi']}\n"
-                f"Jouw positie: {pos['shares']} aandelen @ ${pos['avg_price']}\n"
-                f"P&amp;L: <b>${pnl_usd:+.2f} ({pnl_pct:+.1f}%)</b>\n"
-                f"{markt}"
-            )
-
-            if signal == "SELL":
-                candidates = [
-                    s for s in results
-                    if s["ticker"] not in portfolio
-                    and s.get("signal") != "SELL"
-                    and s.get("rsi") is not None
-                ]
-                if candidates:
-                    best = candidates[0]
-                    msg += (
-                        f"\n\U0001f4a1 <b>Vervangings-advies:</b> {best['ticker']}\n"
-                        f"RSI: {best['rsi']} · Prijs: ${best['price']:.2f} · "
-                        f"Signaal: {best['signal']}"
-                    )
-
-            telegram_send(msg)
-            tg_label = "KOOP" if signal == "BUY" else "VERKOOP"
-            last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": tg_label})
-            save_last_signals(last_signals)   # direct opslaan na elke send
-
         # ── Koopkans buiten portfolio (budget > 0, markt open, RSI < 25) ─────
-        elif (ticker not in portfolio and budget > 0 and ms["is_open"]
-              and (sig.get("rsi") or 50) < 25
-              and not _recently_alerted(ticker, "KOOPKANS")):
+        # Kwaliteitsfilter: geen penny stocks (< $5) + trend boven SMA-200 al in compute_signal
+        if (budget > 0 and ms["is_open"]
+                and (sig.get("rsi") or 50) < 25
+                and (sig.get("price") or 0) >= 5.0
+                and not _recently_alerted(ticker, "KOOPKANS")):
             telegram_send(
                 f"\U0001f7e2 <b>KOOPKANS: {ticker}</b>\n"
                 f"RSI: {sig['rsi']} (sterk oversold)\n"
                 f"Prijs: ${sig['price']:.2f}  ·  Onderste BB: ${sig['lower_bb']:.2f}"
             )
             last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": "KOOPKANS"})
-            save_last_signals(last_signals)   # direct opslaan na elke send
+            save_last_signals(last_signals)
 
     # Sla altijd de laatste bekende state op (ook niet-gealerteerde tickers bijwerken)
     save_last_signals(last_signals)
@@ -730,7 +751,7 @@ def fetch_price_targets(ticker: str) -> dict:
             "sell":        "Verkopen",
         }.get(rec_key, rec_key.capitalize() if rec_key else "—")
 
-        if current and not current:
+        if not current:
             current = full_info.get("currentPrice") or full_info.get("regularMarketPrice")
 
         result["n_analysts"]    = int(n_analysts)
@@ -956,6 +977,42 @@ if page == "Portfolio & P&L":
 
     st.divider()
 
+    # ── Snelle transactie toevoegen ───────────────────────────────────────────
+    with st.expander("➕ Snelle Transactie Toevoegen", expanded=False):
+        with st.form("quick_add_portfolio", clear_on_submit=True):
+            qc1, qc2, qc3, qc4 = st.columns(4)
+            with qc1:
+                qt = st.text_input("Ticker (bijv. AAPL)").strip().upper()
+            with qc2:
+                qa = st.number_input("Aantal aandelen", min_value=0.0, step=0.0001, format="%.4f", value=0.0)
+            with qc3:
+                qp = st.number_input("Prijs ($)", min_value=0.0, step=0.01, format="%.2f", value=0.0)
+            with qc4:
+                qd = st.date_input("Aankoopdatum", value=date.today())
+            if st.form_submit_button("+ Toevoegen aan Portfolio", use_container_width=True):
+                if qt and qa > 0 and qp > 0:
+                    if qt in portfolio:
+                        old_pos   = portfolio[qt]
+                        tot       = old_pos["shares"] + qa
+                        new_avg   = (old_pos["shares"] * old_pos["avg_price"] + qa * qp) / tot
+                        portfolio[qt]["shares"]    = round(tot, 8)
+                        portfolio[qt]["avg_price"] = round(new_avg, 4)
+                    else:
+                        portfolio[qt] = {
+                            "shares":    round(qa, 8),
+                            "avg_price": round(qp, 4),
+                            "buy_date":  qd.isoformat(),
+                            "added":     datetime.now().isoformat(),
+                        }
+                    save_portfolio(portfolio)
+                    fetch_quotes.clear()
+                    st.success(f"✓ {qt}: {qa:.4f} aandelen @ ${qp:.2f} opgeslagen.")
+                    st.rerun()
+                else:
+                    st.error("Vul ticker, aantal (> 0) en prijs (> 0) in.")
+
+    st.divider()
+
     # ── Per-positie detail ────────────────────────────────────────────────────
     for ticker in tickers:
         pos           = portfolio[ticker]
@@ -1030,10 +1087,19 @@ if page == "Portfolio & P&L":
 
             with col_stats:
                 if current_price and not hist.empty:
-                    pnl_usd   = (current_price - pos["avg_price"]) * pos["shares"]
-                    pnl_pct   = ((current_price - pos["avg_price"]) / pos["avg_price"]) * 100
-                    sig_data  = compute_signal(hist["Close"].squeeze())
-                    signal    = sig_data.get("signal", "?")
+                    pnl_usd      = (current_price - pos["avg_price"]) * pos["shares"]
+                    pnl_pct      = ((current_price - pos["avg_price"]) / pos["avg_price"]) * 100
+                    huidige_waarde = current_price * pos["shares"]
+                    sig_data     = compute_signal(hist["Close"].squeeze())
+                    signal       = sig_data.get("signal", "?")
+
+                    # Dagen in bezit
+                    _buy_str = pos.get("buy_date") or pos.get("added", "")
+                    try:
+                        _bought_date = datetime.fromisoformat(_buy_str[:10]).date()
+                        _dagen = (date.today() - _bought_date).days
+                    except Exception:
+                        _dagen = 0
 
                     badge_map = {"BUY": "buy", "SELL": "sell", "HOLD": "hold"}
                     label_map = {"BUY": "BIJKOPEN", "SELL": "VERKOPEN", "HOLD": "VASTHOUDEN"}
@@ -1048,12 +1114,16 @@ if page == "Portfolio & P&L":
                         </div>
                         <div style="font-size:.7rem;color:#64748b">Huidige prijs</div>
                         <div style="font-size:1.3rem;font-weight:800;color:#f1f5f9">${current_price:.2f}</div>
+                        <div style="font-size:.7rem;color:#64748b;margin-top:8px">Huidige waarde</div>
+                        <div style="font-size:1rem;font-weight:700;color:#60a5fa">${huidige_waarde:,.2f}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Gemiddelde inkoop</div>
                         <div style="color:#94a3b8">${pos['avg_price']:.2f}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Aandelen</div>
                         <div style="color:#94a3b8">{pos['shares']}</div>
-                        <div style="font-size:.7rem;color:#64748b;margin-top:8px">Unrealized P&L</div>
-                        <div class="{pnl_cls}">${pnl_usd:+.2f}<br>{pnl_pct:+.1f}%</div>
+                        <div style="font-size:.7rem;color:#64748b;margin-top:8px">Totale winst/verlies</div>
+                        <div class="{pnl_cls}">${pnl_usd:+.2f} ({pnl_pct:+.1f}%)</div>
+                        <div style="font-size:.7rem;color:#64748b;margin-top:8px">Dagen in bezit</div>
+                        <div style="color:#94a3b8">{_dagen} dagen</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">RSI (14)</div>
                         <div style="font-size:1rem;color:#fb923c;font-weight:700">{sig_data.get('rsi', '—')}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">BB Hoog / Laag</div>
@@ -1132,6 +1202,57 @@ if page == "Portfolio & P&L":
                 else:
                     st.warning("Prijsdata niet beschikbaar.")
 
+            # ── Verkopen sectie (onder chart + stats) ────────────────────────
+            st.markdown(
+                '<div style="border-top:1px solid #1e2436;margin-top:10px;padding-top:10px">'
+                '<span style="font-size:.75rem;color:#64748b;text-transform:uppercase;'
+                'letter-spacing:.06em">Positie verkopen</span></div>',
+                unsafe_allow_html=True,
+            )
+            with st.form(f"sell_pos_{ticker}"):
+                sv1, sv2 = st.columns(2)
+                with sv1:
+                    sell_qty = st.number_input(
+                        "Aantal te verkopen",
+                        min_value=0.0,
+                        max_value=float(pos["shares"]),
+                        value=float(pos["shares"]),
+                        step=0.0001,
+                        format="%.4f",
+                    )
+                with sv2:
+                    _default_sell_price = float(current_price) if current_price else float(pos["avg_price"])
+                    sell_pr = st.number_input(
+                        "Verkoopprijs ($)",
+                        min_value=0.0,
+                        value=_default_sell_price,
+                        step=0.01,
+                        format="%.2f",
+                    )
+                sell_b1, sell_b2 = st.columns(2)
+                with sell_b1:
+                    if st.form_submit_button("Deels Verkopen", use_container_width=True):
+                        if sell_qty > 0:
+                            remaining = round(float(pos["shares"]) - sell_qty, 8)
+                            if remaining > 0.00000001:
+                                portfolio[ticker]["shares"] = remaining
+                                save_portfolio(portfolio)
+                                fetch_quotes.clear()
+                                st.success(f"✓ {sell_qty:.4f} {ticker} verkocht @ ${sell_pr:.2f}. {remaining:.4f} resterend.")
+                            else:
+                                del portfolio[ticker]
+                                save_portfolio(portfolio)
+                                fetch_quotes.clear()
+                                st.success(f"✓ {ticker} volledig verkocht @ ${sell_pr:.2f}.")
+                            st.rerun()
+                with sell_b2:
+                    if st.form_submit_button("Volledig Verkopen", use_container_width=True):
+                        del portfolio[ticker]
+                        save_portfolio(portfolio)
+                        fetch_quotes.clear()
+                        st.success(f"✓ {ticker} volledig verkocht @ ${sell_pr:.2f}.")
+                        st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: Markt Scan
@@ -1150,14 +1271,19 @@ elif page == "Markt Scan":
         emoji_map = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🔵"}
         rows = []
         for s in scan_results:
-            signal = s.get("signal", "?")
+            signal   = s.get("signal", "?")
+            sma200   = s.get("sma200")
+            price    = s.get("price")
+            trend_ok = (sma200 is None) or (price and price > sma200)
             rows.append({
                 " ":            emoji_map.get(signal, "⚪"),
                 "Ticker":       s.get("ticker", "?"),
-                "Prijs":        f"${s['price']:.2f}"    if s.get("price")    else "—",
-                "RSI":          f"{s['rsi']:.1f}"       if s.get("rsi")      else "—",
-                "BB Hoog":      f"${s['upper_bb']:.2f}" if s.get("upper_bb") else "—",
-                "BB Laag":      f"${s['lower_bb']:.2f}" if s.get("lower_bb") else "—",
+                "Prijs":        f"${price:.2f}"          if price             else "—",
+                "RSI":          f"{s['rsi']:.1f}"        if s.get("rsi")      else "—",
+                "SMA-200":      f"${sma200:.2f}"         if sma200            else "—",
+                "Trend":        "↑" if trend_ok else "↓",
+                "BB Hoog":      f"${s['upper_bb']:.2f}"  if s.get("upper_bb") else "—",
+                "BB Laag":      f"${s['lower_bb']:.2f}"  if s.get("lower_bb") else "—",
                 "Signaal":      signal,
                 "Portfolio":    "✓" if s.get("ticker") in portfolio else "",
             })
@@ -1482,22 +1608,32 @@ elif page == "Transacties":
     # ── Positie toevoegen / wijzigen ─────────────────────────────────────────
     st.markdown("### Positie Toevoegen of Wijzigen")
     with st.form("add_position"):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             new_ticker = st.text_input("Ticker (bijv. NVDA)").strip().upper()
         with c2:
             new_shares = st.number_input("Aantal aandelen", min_value=0.0,
                                          value=0.0, step=0.00000001, format="%.8f")
         with c3:
-            new_price  = st.number_input("Gemiddelde inkoopprijs ($)", min_value=0.0,
+            new_price  = st.number_input("Inkoopprijs ($)", min_value=0.0,
                                          value=0.0, step=0.01, format="%.2f")
+        with c4:
+            new_date   = st.date_input("Aankoopdatum", value=date.today())
         if st.form_submit_button("Opslaan", use_container_width=True):
             if new_ticker and new_shares > 0 and new_price > 0:
-                portfolio[new_ticker] = {
-                    "shares":    new_shares,
-                    "avg_price": new_price,
-                    "added":     datetime.now().isoformat(),
-                }
+                if new_ticker in portfolio:
+                    old_p     = portfolio[new_ticker]
+                    tot       = old_p["shares"] + new_shares
+                    new_avg   = (old_p["shares"] * old_p["avg_price"] + new_shares * new_price) / tot
+                    portfolio[new_ticker]["shares"]    = round(tot, 8)
+                    portfolio[new_ticker]["avg_price"] = round(new_avg, 4)
+                else:
+                    portfolio[new_ticker] = {
+                        "shares":    new_shares,
+                        "avg_price": new_price,
+                        "buy_date":  new_date.isoformat(),
+                        "added":     datetime.now().isoformat(),
+                    }
                 save_portfolio(portfolio)
                 fetch_quotes.clear()
                 st.success(f"✓ {new_ticker}: {new_shares} aandelen @ ${new_price:.2f} opgeslagen.")
@@ -1550,7 +1686,7 @@ elif page == "Transacties":
 
             with st.expander(f"**{ticker}** — {pos['shares']} aandelen @ ${pos['avg_price']:.4f}", expanded=False):
                 with st.form(f"edit_{ticker}"):
-                    ec1, ec2 = st.columns(2)
+                    ec1, ec2, ec3 = st.columns(3)
                     with ec1:
                         edit_shares = st.number_input(
                             "Totaal aantal aandelen",
@@ -1567,6 +1703,13 @@ elif page == "Transacties":
                             step=0.0001,
                             format="%.4f",
                         )
+                    with ec3:
+                        _bd_str = pos.get("buy_date") or pos.get("added", "")[:10]
+                        try:
+                            _bd_default = date.fromisoformat(_bd_str)
+                        except Exception:
+                            _bd_default = date.today()
+                        edit_date = st.date_input("Aankoopdatum", value=_bd_default)
 
                     sb1, sb2 = st.columns([2, 1])
                     with sb1:
@@ -1574,6 +1717,7 @@ elif page == "Transacties":
                             if edit_shares > 0 and edit_price > 0:
                                 portfolio[ticker]["shares"]    = round(edit_shares, 8)
                                 portfolio[ticker]["avg_price"] = round(edit_price, 4)
+                                portfolio[ticker]["buy_date"]  = edit_date.isoformat()
                                 save_portfolio(portfolio)
                                 fetch_quotes.clear()
                                 st.success(f"✓ {ticker} bijgewerkt: {edit_shares} aandelen @ ${edit_price:.4f}")
