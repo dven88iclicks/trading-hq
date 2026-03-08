@@ -5,6 +5,7 @@ advice_log.json
 dashboard_password.txt
 last_signals.json
 settings.json
+sessions.json
 __pycache__/
 *.pyc
 .env

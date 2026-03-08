@@ -10,6 +10,7 @@ import os
 import json
 import time
 import hmac
+import secrets
 import threading
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -49,8 +50,10 @@ SIGNALS_FILE        = Path("signals.json")
 ADVICE_FILE         = Path("advice_log.json")
 LAST_SIGNALS_FILE   = Path("last_signals.json")
 SETTINGS_FILE       = Path("settings.json")
+SESSIONS_FILE       = Path("sessions.json")
 SCAN_INTERVAL       = 30 * 60  # seconds
 ALERT_COOLDOWN_H    = 6        # minimaal 6 uur tussen dezelfde alert per ticker
+SESSION_TIMEOUT_MIN = 10       # automatisch uitloggen na X minuten inactiviteit
 
 # Top-50 volatiele aandelen watchlist (inclusief MRCY)
 WATCHLIST = [
@@ -250,6 +253,72 @@ def load_settings() -> dict:
 def save_settings(s: dict) -> None:
     with _lock:
         SETTINGS_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False))
+
+
+# ── Session management ────────────────────────────────────────────────────────
+
+def _load_sessions() -> dict:
+    with _lock:
+        if SESSIONS_FILE.exists():
+            try:
+                return json.loads(SESSIONS_FILE.read_text())
+            except Exception:
+                pass
+    return {}
+
+
+def _save_sessions(data: dict) -> None:
+    with _lock:
+        SESSIONS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _create_session() -> str:
+    """Maak een nieuw sessie-token, sla op, verwijder verlopen sessies."""
+    token    = secrets.token_urlsafe(32)
+    now_str  = datetime.now().isoformat()
+    sessions = _load_sessions()
+    sessions[token] = {"created": now_str, "last_activity": now_str}
+    # Opruimen: verwijder sessies ouder dan 24 uur
+    cutoff = datetime.now().timestamp() - 86400
+    sessions = {
+        k: v for k, v in sessions.items()
+        if datetime.fromisoformat(v.get("last_activity", now_str)).timestamp() > cutoff
+    }
+    sessions[token] = {"created": now_str, "last_activity": now_str}
+    _save_sessions(sessions)
+    return token
+
+
+def _is_session_valid(token: str) -> bool:
+    """Controleer of het token bestaat én de inactiviteitsgrens niet overschreden is."""
+    if not token:
+        return False
+    sessions = _load_sessions()
+    session  = sessions.get(token)
+    if not session:
+        return False
+    try:
+        elapsed_min = (
+            datetime.now() - datetime.fromisoformat(session["last_activity"])
+        ).total_seconds() / 60
+        return elapsed_min < SESSION_TIMEOUT_MIN
+    except Exception:
+        return False
+
+
+def _touch_session(token: str) -> None:
+    """Ververs de last_activity timestamp (bij elke pagina-interactie)."""
+    sessions = _load_sessions()
+    if token in sessions:
+        sessions[token]["last_activity"] = datetime.now().isoformat()
+        _save_sessions(sessions)
+
+
+def _delete_session(token: str) -> None:
+    """Verwijder sessie bij uitloggen."""
+    sessions = _load_sessions()
+    sessions.pop(token, None)
+    _save_sessions(sessions)
 
 
 def upsert_advice(record: dict) -> None:
@@ -865,9 +934,27 @@ def _get_active_password() -> str:
 
 
 def check_login() -> bool:
+    # ── Al ingelogd in deze sessie ────────────────────────────────────────────
     if st.session_state.get("authenticated"):
+        token = st.session_state.get("_session_token")
+        if token:
+            _touch_session(token)   # activiteit bijhouden → timeout verlengen
         return True
 
+    # ── Sessie-token uit URL uitlezen (persistent login na refresh) ───────────
+    url_token = st.query_params.get("s")
+    if url_token and _is_session_valid(url_token):
+        st.session_state["authenticated"]    = True
+        st.session_state["_session_token"]   = url_token
+        _touch_session(url_token)
+        return True
+
+    # Token bestaat maar is verlopen → URL opschonen en opnieuw inloggen tonen
+    if url_token and not _is_session_valid(url_token):
+        _delete_session(url_token)
+        st.query_params.clear()
+
+    # ── Login-scherm ──────────────────────────────────────────────────────────
     _, col, _ = st.columns([1, 1.4, 1])
     with col:
         st.markdown("<br><br>", unsafe_allow_html=True)
@@ -882,7 +969,10 @@ def check_login() -> bool:
                 if not active_pwd:
                     st.warning("Geen wachtwoord geconfigureerd. Stel DASHBOARD_PASSWORD in via Railway Variables.")
                 elif hmac.compare_digest(pwd, active_pwd):
-                    st.session_state.authenticated = True
+                    new_token = _create_session()
+                    st.session_state["authenticated"]  = True
+                    st.session_state["_session_token"] = new_token
+                    st.query_params["s"] = new_token   # token in URL → persistent
                     st.rerun()
                 else:
                     st.error("Onjuist wachtwoord.")
@@ -939,7 +1029,12 @@ with st.sidebar:
     st.divider()
 
     if st.button("🚪 Uitloggen", use_container_width=True):
+        _tok = st.session_state.get("_session_token")
+        if _tok:
+            _delete_session(_tok)
         st.session_state.authenticated = False
+        st.session_state.pop("_session_token", None)
+        st.query_params.clear()
         st.rerun()
 
 
