@@ -1489,12 +1489,10 @@ if page == "Portfolio & P&L":
                     else:
                         _upside_row = ""
 
+                    _pending_tag = "&nbsp;<span style='font-size:.65rem;color:#fb923c;font-weight:600'>⏳ PENDING</span>" if _is_pending else ""
                     st.markdown(f"""
                     <div class="card">
-                        <div style="margin-bottom:12px">
-                            <span class="badge-{badge_cls}">{label}</span>
-                            {"&nbsp;<span style='font-size:.65rem;color:#fb923c;font-weight:600'>⏳ PENDING</span>" if _is_pending else ""}
-                        </div>
+                        <div style="margin-bottom:12px"><span class="badge-{badge_cls}">{label}</span>{_pending_tag}</div>
                         <div style="font-size:.7rem;color:#64748b">Huidige prijs</div>
                         <div style="font-size:1.3rem;font-weight:800;color:#f1f5f9">{_fmt(current_price)}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Huidige waarde</div>
