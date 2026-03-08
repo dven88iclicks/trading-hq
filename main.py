@@ -11,8 +11,9 @@ import json
 import time
 import hmac
 import threading
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -28,21 +29,28 @@ import streamlit as st
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _secret(key: str, default: str = "") -> str:
-    """Read from st.secrets first, fall back to environment variable."""
+    """Environment variable first (Railway), then st.secrets (lokaal)."""
+    env_val = os.getenv(key)
+    if env_val:
+        return env_val
     try:
-        return st.secrets[key]
+        val = st.secrets.get(key, default)
+        return val if val else default
     except Exception:
-        return os.getenv(key, default)
+        return default
 
 
 TELEGRAM_TOKEN     = _secret("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID   = _secret("TELEGRAM_CHAT_ID")
 DASHBOARD_PASSWORD = _secret("DASHBOARD_PASSWORD")
 
-PORTFOLIO_FILE = Path("portfolio.json")
-SIGNALS_FILE   = Path("signals.json")
-ADVICE_FILE    = Path("advice_log.json")
-SCAN_INTERVAL  = 30 * 60  # seconds
+PORTFOLIO_FILE      = Path("portfolio.json")
+SIGNALS_FILE        = Path("signals.json")
+ADVICE_FILE         = Path("advice_log.json")
+LAST_SIGNALS_FILE   = Path("last_signals.json")
+SETTINGS_FILE       = Path("settings.json")
+SCAN_INTERVAL       = 30 * 60  # seconds
+ALERT_COOLDOWN_H    = 6        # minimaal 6 uur tussen dezelfde alert per ticker
 
 # Top-50 volatiele aandelen watchlist (inclusief MRCY)
 WATCHLIST = [
@@ -54,6 +62,98 @@ WATCHLIST = [
     "JOBY", "ACHR", "EVGO", "CHPT", "PLUG", "FCEL", "ARRY", "STEM",
     "BLNK", "WKHS",
 ]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKTUREN  (NYSE / NASDAQ — ET-tijdzone)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ET = ZoneInfo("America/New_York")
+_NL = ZoneInfo("Europe/Amsterdam")
+
+# NYSE feestdagen 2025-2027 (officieel gesloten)
+_US_HOLIDAYS = {
+    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 4, 18),
+    date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1),
+    date(2025, 11, 27), date(2025, 12, 25),
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
+    date(2026, 11, 26), date(2026, 12, 25),
+    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
+    date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
+    date(2027, 11, 25), date(2027, 12, 24),
+}
+
+
+def _is_trading_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in _US_HOLIDAYS
+
+
+def _next_open(from_dt: datetime) -> datetime:
+    """Geeft de eerstvolgende marktopening terug als datetime (ET)."""
+    d = from_dt.date()
+    # Als vandaag een handelsdag is en de markt nog niet open was, is het vandaag 09:30
+    if _is_trading_day(d):
+        open_today = from_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        if from_dt < open_today:
+            return open_today
+    # Zoek volgende handelsdag
+    d += timedelta(days=1)
+    for _ in range(10):
+        if _is_trading_day(d):
+            return datetime(d.year, d.month, d.day, 9, 30, tzinfo=_ET)
+        d += timedelta(days=1)
+    return datetime(d.year, d.month, d.day, 9, 30, tzinfo=_ET)
+
+
+def market_status() -> dict:
+    """Geeft live marktstatusinfo terug in ET én NL-tijd."""
+    now_et    = datetime.now(_ET)
+    today     = now_et.date()
+    open_et   = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_et  = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+
+    trading_day = _is_trading_day(today)
+
+    if trading_day and open_et <= now_et < close_et:
+        status   = "open"
+        sluit_in = close_et - now_et
+        m        = int(sluit_in.total_seconds() // 60)
+        msg      = f"Markt OPEN  ·  sluit over {m // 60}u {m % 60}m (ET 16:00)"
+        color    = "#4ade80"
+    elif trading_day and now_et < open_et:
+        status   = "pre-market"
+        opent_in = open_et - now_et
+        m        = int(opent_in.total_seconds() // 60)
+        msg      = f"Pre-market  ·  markt opent over {m // 60}u {m % 60}m"
+        color    = "#fb923c"
+    else:
+        if today.weekday() >= 5:
+            status = "weekend"
+        elif today in _US_HOLIDAYS:
+            status = "feestdag"
+        else:
+            status = "nabeurs"
+        nxt      = _next_open(now_et)
+        nxt_nl   = nxt.astimezone(_NL)
+        dag_nl   = ["ma", "di", "wo", "do", "vr", "za", "zo"][nxt_nl.weekday()]
+        msg      = f"Markt GESLOTEN  ·  opent {dag_nl} {nxt_nl.strftime('%d %b om %H:%M')} NL-tijd"
+        color    = "#f87171"
+
+    next_open_et = _next_open(now_et)
+    next_open_nl = next_open_et.astimezone(_NL)
+    now_nl       = now_et.astimezone(_NL)
+
+    return {
+        "is_open":       status == "open",
+        "status":        status,
+        "msg":           msg,
+        "color":         color,
+        "now_nl":        now_nl,
+        "now_et":        now_et,
+        "next_open_nl":  next_open_nl,
+        "next_open_et":  next_open_et,
+    }
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # THREAD SAFETY
@@ -121,6 +221,37 @@ def save_advice(records: list) -> None:
         ADVICE_FILE.write_text(json.dumps(records, indent=2, ensure_ascii=False))
 
 
+def load_last_signals() -> dict:
+    """Laad het laatste verzonden signaal per ticker {ticker: {signal, price, sent_at}}."""
+    with _lock:
+        if LAST_SIGNALS_FILE.exists():
+            try:
+                return json.loads(LAST_SIGNALS_FILE.read_text())
+            except Exception:
+                pass
+    return {}
+
+
+def save_last_signals(data: dict) -> None:
+    with _lock:
+        LAST_SIGNALS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def load_settings() -> dict:
+    with _lock:
+        if SETTINGS_FILE.exists():
+            try:
+                return json.loads(SETTINGS_FILE.read_text())
+            except Exception:
+                pass
+    return {"budget_eur": 0.0}
+
+
+def save_settings(s: dict) -> None:
+    with _lock:
+        SETTINGS_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False))
+
+
 def upsert_advice(record: dict) -> None:
     """Voeg toe of update op basis van advice_id."""
     records = load_advice()
@@ -152,8 +283,106 @@ def calc_bb(prices: pd.Series, period: int = 20, k: float = 2.0):
     return sma + k * sigma, sma, sma - k * sigma
 
 
+def forecast_48h(close: pd.Series) -> dict:
+    """
+    Schat de verwachte prijsbeweging in de komende 48 uur op basis van:
+    - Kortetermijn momentum (5-daags)
+    - RSI-richting (stijgend of dalend)
+    - Bollinger Band positie (mean reversion)
+    - Recente volatiliteit (ATR-gebaseerd prijsbereik)
+    """
+    if len(close) < 10:
+        return {"richting": "onbekend", "target_laag": None, "target_hoog": None,
+                "verwachting_pct": 0.0, "onderbouwing": "Onvoldoende data."}
+
+    current   = float(close.iloc[-1])
+    rsi_val   = float(calc_rsi(close).iloc[-1])
+    rsi_prev  = float(calc_rsi(close).iloc[-2])
+    upper, mid, lower = calc_bb(close)
+
+    # 5-daags momentum: gemiddelde dagelijkse return
+    returns_5d    = close.pct_change().iloc[-5:]
+    momentum      = float(returns_5d.mean())        # gem. dagelijks rendement
+    recent_vol    = float(returns_5d.std())          # dagelijkse volatiliteit
+
+    # 48u bereik op basis van volatiliteit (2 handelsdagen ≈ √2 × dagvol)
+    vol_48h = recent_vol * (2 ** 0.5)
+    range_h = current * (1 + vol_48h)
+    range_l = current * (1 - vol_48h)
+
+    # Richtingsbepaling: combineer momentum + RSI-richting + BB-positie
+    score = 0
+
+    # Momentum
+    if momentum > 0.005:
+        score += 2
+    elif momentum > 0:
+        score += 1
+    elif momentum < -0.005:
+        score -= 2
+    else:
+        score -= 1
+
+    # RSI trend (stijgend of dalend)
+    if rsi_val > rsi_prev:
+        score += 1
+    else:
+        score -= 1
+
+    # BB mean reversion: prijs dicht bij onderste band = verwacht herstel
+    bb_range = float(upper.iloc[-1]) - float(lower.iloc[-1])
+    if bb_range > 0:
+        bb_pos = (current - float(lower.iloc[-1])) / bb_range  # 0=onderaan, 1=bovenaan
+        if bb_pos < 0.2:
+            score += 2   # oversold → verwacht herstel omhoog
+        elif bb_pos > 0.8:
+            score -= 2   # overbought → verwacht correctie
+
+    # Verwacht rendement: schaal score naar % beweging
+    verwachting_pct = round(score * (recent_vol * 100 * 0.4), 2)
+    target_mid      = current * (1 + verwachting_pct / 100)
+    target_laag     = round(min(range_l, target_mid * 0.995), 4)
+    target_hoog     = round(max(range_h, target_mid * 1.005), 4)
+
+    if score >= 2:
+        richting = "omhoog"
+    elif score <= -2:
+        richting = "omlaag"
+    else:
+        richting = "neutraal"
+
+    redenen = []
+    if momentum > 0:
+        redenen.append(f"positief 5d-momentum (+{momentum*100:.2f}%/dag)")
+    else:
+        redenen.append(f"negatief 5d-momentum ({momentum*100:.2f}%/dag)")
+    if rsi_val > rsi_prev:
+        redenen.append(f"RSI stijgend ({rsi_prev:.0f}→{rsi_val:.0f})")
+    else:
+        redenen.append(f"RSI dalend ({rsi_prev:.0f}→{rsi_val:.0f})")
+    if bb_range > 0:
+        if bb_pos < 0.3:
+            redenen.append("prijs nabij BB-onderkant (herstelkans)")
+        elif bb_pos > 0.7:
+            redenen.append("prijs nabij BB-bovenkant (correctierisico)")
+
+    return {
+        "richting":        richting,
+        "verwachting_pct": verwachting_pct,
+        "target_laag":     target_laag,
+        "target_hoog":     target_hoog,
+        "onderbouwing":    " · ".join(redenen),
+    }
+
+
 def compute_signal(close: pd.Series) -> dict:
-    """Compute BUY / HOLD / SELL signal for a Close price series."""
+    """
+    Professionele signaalberekening:
+    - BUY  : RSI < 30  ÉN prijs ≤ onderste Bollinger Band  (beide voorwaarden)
+    - SELL : RSI > 70  ÉN prijs ≥ bovenste Bollinger Band  (beide voorwaarden)
+    - HOLD : alles daartussenin
+    Beide voorwaarden tegelijk = significante technische bevestiging.
+    """
     if len(close) < 20:
         return {"signal": "DATA_ERROR", "rsi": None, "upper_bb": None, "lower_bb": None, "price": None}
 
@@ -163,9 +392,9 @@ def compute_signal(close: pd.Series) -> dict:
     upper_val = float(upper.iloc[-1])
     lower_val = float(lower.iloc[-1])
 
-    if rsi_val < 30 or current <= lower_val:
+    if rsi_val < 30 and current <= lower_val:
         signal = "BUY"
-    elif rsi_val > 70 or current >= upper_val:
+    elif rsi_val > 70 and current >= upper_val:
         signal = "SELL"
     else:
         signal = "HOLD"
@@ -248,7 +477,40 @@ def run_scan() -> list:
     # Sorteer op RSI (laagste = meest oversold)
     results.sort(key=lambda x: x.get("rsi") or 50)
 
-    # Bewaar signalen en stuur Telegram-berichten
+    ms           = market_status()
+    last_signals = load_last_signals()
+    settings     = load_settings()
+    budget       = float(settings.get("budget_eur", 0))
+    now          = datetime.now()
+
+    def _recently_alerted(ticker: str, alert_type: str) -> bool:
+        """True als dit exact alert-type al verstuurd is binnen ALERT_COOLDOWN_H uur."""
+        prev = last_signals.get(ticker, {})
+        if prev.get("last_telegram") != alert_type:
+            return False
+        sent_str = prev.get("sent_at")
+        if not sent_str:
+            return False
+        try:
+            hours_ago = (now - datetime.fromisoformat(sent_str)).total_seconds() / 3600
+            return hours_ago < ALERT_COOLDOWN_H
+        except Exception:
+            return False
+
+    def _cooldown_ok(ticker: str, signal: str) -> bool:
+        """True als de laatste alert langer dan ALERT_COOLDOWN_H geleden is."""
+        return not _recently_alerted(ticker, signal)
+
+    def _is_extreme(sig: dict) -> bool:
+        """
+        Extreem zeldzame koopkans: RSI < 15 én prijs ≥ 15% onder onderste Bollinger Band.
+        Definiëren als 'kans van verdubbelen in 24u' — wordt bijna nooit actief.
+        """
+        rsi   = sig.get("rsi") or 50
+        price = sig.get("price") or 0
+        lb    = sig.get("lower_bb") or price
+        return rsi < 15 and lb > 0 and price < lb * 0.85
+
     for sig in results:
         ticker = sig["ticker"]
         signal = sig.get("signal")
@@ -256,11 +518,68 @@ def run_scan() -> list:
         if signal in ("BUY", "SELL"):
             append_signal(sig)
 
+        prev         = last_signals.get(ticker, {})
+        prev_signal  = prev.get("signal")
+        prev_alerted = prev.get("alerted", False)
+
+        # Altijd huidige stand bijwerken (sent_at alleen bij daadwerkelijk sturen)
+        last_signals[ticker] = {
+            "signal":   signal,
+            "price":    sig.get("price"),
+            "updated":  now.isoformat(),
+            "sent_at":  prev.get("sent_at"),
+            "alerted":  prev_alerted,
+        }
+
+        # ── Advies verlopen: was actief + gealerteerd, nu HOLD ───────────────
+        if prev_signal in ("BUY", "SELL") and prev_alerted and signal == "HOLD":
+            if _cooldown_ok(ticker, "EXPIRED"):
+                telegram_send(
+                    f"⚠️ <b>Advies {ticker}: Verlopen</b> (Prijs is gestabiliseerd)\n"
+                    f"RSI: {sig['rsi']}  ·  Prijs: ${sig['price']:.2f}"
+                )
+                last_signals[ticker].update({
+                    "alerted":       False,
+                    "sent_at":       now.isoformat(),
+                    "last_telegram": "VERLOPEN",
+                })
+            save_last_signals(last_signals)
+            continue
+
+        # ── Zelfde alert-type al recent verstuurd → stilte ───────────────────
+        alert_type = "KOOP" if signal == "BUY" else ("VERKOOP" if signal == "SELL" else None)
+        if alert_type and _recently_alerted(ticker, alert_type):
+            continue
+
+        # ── Markt dicht + geen actief signaal → overslaan ────────────────────
+        if not ms["is_open"] and signal not in ("BUY", "SELL"):
+            continue
+
+        # ── SELL alleen voor eigen posities ──────────────────────────────────
+        if signal == "SELL" and ticker not in portfolio:
+            continue
+
+        # ── BUY: budget = 0 → alleen bij extreme kans, anders stilte ─────────
+        if signal == "BUY" and budget <= 0:
+            if not _is_extreme(sig) or _recently_alerted(ticker, "EXTREME BUY"):
+                continue
+            telegram_send(
+                f"🚨 <b>EXTREME KOOPKANS: {ticker}</b>\n"
+                f"RSI: {sig['rsi']} (extreem oversold) · Prijs: ${sig['price']:.2f}\n"
+                f"Prijs ligt ver onder Bollinger Band — overweeg bij te storten.\n"
+                f"Budget staat op €0 — dit is een uitzonderlijke situatie."
+            )
+            last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": "EXTREME BUY"})
+            save_last_signals(last_signals)
+            continue
+
+        # ── Alert voor eigen portfolio-positie ───────────────────────────────
         if ticker in portfolio and signal in ("BUY", "SELL"):
             pos     = portfolio[ticker]
             pnl_usd = (sig["price"] - pos["avg_price"]) * pos["shares"]
             pnl_pct = ((sig["price"] - pos["avg_price"]) / pos["avg_price"]) * 100
             emoji   = "🔴 VERKOPEN" if signal == "SELL" else "🟢 BIJKOPEN"
+            markt   = "⏸ Markt gesloten — uitvoering bij opening" if not ms["is_open"] else "⬤ Markt open"
 
             msg = (
                 f"<b>{emoji}: {ticker}</b>\n"
@@ -268,9 +587,9 @@ def run_scan() -> list:
                 f"RSI: {sig['rsi']}\n"
                 f"Jouw positie: {pos['shares']} aandelen @ ${pos['avg_price']}\n"
                 f"P&amp;L: <b>${pnl_usd:+.2f} ({pnl_pct:+.1f}%)</b>\n"
+                f"{markt}"
             )
 
-            # Smart Signal: vervangingsadvies bij SELL
             if signal == "SELL":
                 candidates = [
                     s for s in results
@@ -279,7 +598,7 @@ def run_scan() -> list:
                     and s.get("rsi") is not None
                 ]
                 if candidates:
-                    best = candidates[0]  # laagste RSI
+                    best = candidates[0]
                     msg += (
                         f"\n\U0001f4a1 <b>Vervangings-advies:</b> {best['ticker']}\n"
                         f"RSI: {best['rsi']} · Prijs: ${best['price']:.2f} · "
@@ -287,14 +606,21 @@ def run_scan() -> list:
                     )
 
             telegram_send(msg)
+            tg_label = "KOOP" if signal == "BUY" else "VERKOOP"
+            last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": tg_label})
 
-        # Extra alert voor sterke oversold kansen buiten portfolio
-        elif ticker not in portfolio and (sig.get("rsi") or 50) < 25:
+        # ── Koopkans buiten portfolio (budget > 0, markt open, RSI < 25) ─────
+        elif (ticker not in portfolio and budget > 0 and ms["is_open"]
+              and (sig.get("rsi") or 50) < 25
+              and not _recently_alerted(ticker, "KOOPKANS")):
             telegram_send(
                 f"\U0001f7e2 <b>KOOPKANS: {ticker}</b>\n"
                 f"RSI: {sig['rsi']} (sterk oversold)\n"
                 f"Prijs: ${sig['price']:.2f}  ·  Onderste BB: ${sig['lower_bb']:.2f}"
             )
+            last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": "KOOPKANS"})
+
+    save_last_signals(last_signals)
 
     return results
 
@@ -359,6 +685,76 @@ def fetch_scan() -> list:
 
 
 @st.cache_data(ttl=3600)
+def fetch_price_targets(ticker: str) -> dict:
+    """
+    Haal live analistenkoersdoelen op via Yahoo Finance (yfinance).
+    - 1 jaar  : analistenconsensus (gemiddeld koersdoel)
+    - 3 maanden: interpolatie tussen huidig en 1-jaarsdoel (25% van de weg)
+    - 1 maand : technische trendprojectie op basis van 3-maands momentum
+    Gecached 1 uur.
+    """
+    result = {}
+    try:
+        info    = yf.Ticker(ticker).fast_info
+        current = float(info.last_price) if hasattr(info, "last_price") else None
+    except Exception:
+        current = None
+
+    try:
+        full_info       = yf.Ticker(ticker).info
+        target_1y       = full_info.get("targetMeanPrice")
+        target_1y_high  = full_info.get("targetHighPrice")
+        target_1y_low   = full_info.get("targetLowPrice")
+        n_analysts      = full_info.get("numberOfAnalystOpinions") or 0
+        rec_key         = (full_info.get("recommendationKey") or "").lower()
+
+        rec_nl = {
+            "strong buy":  "Sterk kopen",
+            "buy":         "Kopen",
+            "hold":        "Houden",
+            "underperform":"Onderpresteren",
+            "sell":        "Verkopen",
+        }.get(rec_key, rec_key.capitalize() if rec_key else "—")
+
+        if current and not current:
+            current = full_info.get("currentPrice") or full_info.get("regularMarketPrice")
+
+        result["n_analysts"]    = int(n_analysts)
+        result["recommendation"] = rec_nl
+        result["target_1y"]     = round(target_1y, 2)   if target_1y     else None
+        result["target_1y_high"]= round(target_1y_high, 2) if target_1y_high else None
+        result["target_1y_low"] = round(target_1y_low, 2)  if target_1y_low  else None
+
+        if current and target_1y:
+            move = target_1y - current
+            result["target_3m"]     = round(current + move * 0.25, 2)
+            result["target_3m_pct"] = round((move * 0.25 / current) * 100, 1)
+            result["target_1y_pct"] = round((move / current) * 100, 1)
+
+    except Exception:
+        pass
+
+    # 1-maand target: technisch momentum (3-maands data)
+    try:
+        hist = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if not hist.empty:
+            close   = hist["Close"].squeeze()
+            fc      = forecast_48h(close)
+            # 48u verwachting × ~10 (20 handelsdagen / 2) = ruwe 1-maandsprognose
+            pct_1m  = (fc.get("verwachting_pct") or 0) * 10
+            cur     = float(close.iloc[-1])
+            result["target_1m"]     = round(cur * (1 + pct_1m / 100), 2)
+            result["target_1m_pct"] = round(pct_1m, 1)
+            if not current:
+                current = cur
+    except Exception:
+        pass
+
+    result["current"] = current
+    return result
+
+
+@st.cache_data(ttl=3600)
 def fetch_eur_usd() -> float:
     """Haal live EUR/USD koers op via yfinance. Fallback: 1.08."""
     try:
@@ -400,6 +796,15 @@ div[data-testid="stMetricValue"] { color:#007BFF !important; font-weight:800 !im
 .pnl-pos { color:#4ade80; font-weight:700; }
 .pnl-neg { color:#f87171; font-weight:700; }
 .card { background:#12161f; border:1px solid #1e2436; border-radius:8px; padding:14px 18px; }
+
+/* Expander: donkere achtergrond + leesbare tekst */
+details { background:#12161f !important; border:1px solid #1e2436 !important; border-radius:8px !important; }
+details summary { background:#12161f !important; color:#f1f5f9 !important; font-weight:600 !important; }
+details summary:hover { background:#1e2436 !important; }
+details summary p { color:#f1f5f9 !important; }
+div[data-testid="stExpander"] { background:#12161f !important; border:1px solid #1e2436 !important; border-radius:8px !important; }
+div[data-testid="stExpander"] summary { color:#f1f5f9 !important; }
+div[data-testid="stExpander"] > div { background:#12161f !important; }
 .badge-buy  { background:#14532d; color:#4ade80; padding:3px 10px;
     border-radius:999px; font-size:.75rem; font-weight:700; }
 .badge-sell { background:#450a0a; color:#f87171; padding:3px 10px;
@@ -465,6 +870,27 @@ with st.sidebar:
         ["Portfolio & P&L", "Markt Scan", "Investeer Advies", "Signaalgeschiedenis", "Transacties"],
         label_visibility="collapsed",
     )
+    st.divider()
+
+    # ── Budget instelling ─────────────────────────────────────────────────────
+    _settings = load_settings()
+    _budget   = float(_settings.get("budget_eur", 0))
+
+    st.markdown("**Beschikbaar budget**")
+    _new_budget = st.number_input(
+        "€ investeerbaar", min_value=0.0, value=_budget,
+        step=50.0, format="%.2f", label_visibility="collapsed",
+        key="sidebar_budget",
+    )
+    if _new_budget != _budget:
+        save_settings({**_settings, "budget_eur": _new_budget})
+        st.rerun()
+
+    if _budget <= 0:
+        st.markdown('<span style="color:#f87171;font-size:.75rem">⛔ Budget €0 — BUY alerts uit</span>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<span style="color:#4ade80;font-size:.75rem">✓ Budget €{_budget:,.0f} actief</span>', unsafe_allow_html=True)
+
     st.divider()
 
     if st.button("🔄 Nu Scannen", use_container_width=True):
@@ -620,6 +1046,75 @@ if page == "Portfolio & P&L":
                         <div style="font-size:.8rem;color:#60a5fa">${sig_data.get('upper_bb', '—')} / ${sig_data.get('lower_bb', '—')}</div>
                     </div>
                     """, unsafe_allow_html=True)
+
+                    # Telegram sync badge
+                    _ls   = load_last_signals().get(ticker, {})
+                    _tg   = _ls.get("last_telegram")
+                    _sent = (_ls.get("sent_at") or "")[:16].replace("T", " ")
+                    if _tg:
+                        _tg_color = {
+                            "KOOP":       "#4ade80",
+                            "VERKOOP":    "#f87171",
+                            "VERLOPEN":   "#94a3b8",
+                            "EXTREME BUY":"#facc15",
+                            "KOOPKANS":   "#60a5fa",
+                        }.get(_tg, "#64748b")
+                        st.markdown(
+                            f'<div style="background:#0c1220;border:1px solid #1e2436;'
+                            f'border-radius:6px;padding:6px 10px;margin-top:6px;font-size:.72rem">'
+                            f'<span style="color:#475569">Telegram: </span>'
+                            f'<span style="color:{_tg_color};font-weight:700">{_tg}</span>'
+                            f'{"  <span style=\\'color:#334155\\'>" + _sent + "</span>" if _sent else ""}'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    # Koersdoelen sectie
+                    pt = fetch_price_targets(ticker)
+                    if pt:
+                        def _tgt_row(label, price, pct, color):
+                            if price is None:
+                                return f'<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>'
+                            arrow = "▲" if (pct or 0) >= 0 else "▼"
+                            return (
+                                f'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #1e2436">'
+                                f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
+                                f'<span style="font-size:.78rem;color:{color};font-weight:600">'
+                                f'${price:.2f} <span style="font-size:.68rem">{arrow}{abs(pct or 0):.1f}%</span></span>'
+                                f'</div>'
+                            )
+
+                        t1m  = pt.get("target_1m");  p1m  = pt.get("target_1m_pct", 0)
+                        t3m  = pt.get("target_3m");  p3m  = pt.get("target_3m_pct", 0)
+                        t1y  = pt.get("target_1y");  p1y  = pt.get("target_1y_pct", 0)
+                        t1yh = pt.get("target_1y_high")
+                        t1yl = pt.get("target_1y_low")
+                        rec  = pt.get("recommendation", "—")
+                        na   = pt.get("n_analysts", 0)
+
+                        c1m  = "#4ade80" if (p1m or 0) >= 0 else "#f87171"
+                        c3m  = "#4ade80" if (p3m or 0) >= 0 else "#f87171"
+                        c1y  = "#4ade80" if (p1y or 0) >= 0 else "#f87171"
+
+                        rec_color = {"Kopen": "#4ade80", "Sterk kopen": "#4ade80",
+                                     "Houden": "#fb923c", "Verkopen": "#f87171",
+                                     "Onderpresteren": "#f87171"}.get(rec, "#94a3b8")
+
+                        analyst_range = f"${t1yl:.2f} – ${t1yh:.2f}" if t1yl and t1yh else "—"
+
+                        st.markdown(
+                            f'<div class="card" style="margin-top:8px">'
+                            f'<div style="font-size:.65rem;color:#475569;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Koersdoelen</div>'
+                            + _tgt_row("1 maand (technisch)", t1m, p1m, c1m)
+                            + _tgt_row("3 maanden (analisten)", t3m, p3m, c3m)
+                            + _tgt_row("1 jaar (consensus)", t1y, p1y, c1y)
+                            + f'<div style="padding:5px 0;font-size:.7rem;color:#64748b">Bandbreedte 1j: <span style="color:#94a3b8">{analyst_range}</span></div>'
+                            f'<div style="padding:3px 0;font-size:.7rem;color:#64748b">Aanbeveling: <span style="color:{rec_color};font-weight:700">{rec}</span>'
+                            f'{"  <span style=\\'color:#475569\\'>(" + str(na) + " analisten)</span>" if na else ""}'
+                            f'</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
                 else:
                     st.warning("Prijsdata niet beschikbaar.")
 
@@ -668,6 +1163,21 @@ elif page == "Investeer Advies":
     st.caption(
         "Voer je beschikbare budget in. De tool berekent welke aandelen uit de watchlist "
         "het beste koopsignaal hebben en hoeveel je kunt kopen. Geef daarna aan of je het advies hebt gevolgd."
+    )
+
+    # ── Marktstatus banner ────────────────────────────────────────────────────
+    ms = market_status()
+    dag_map = ["ma","di","wo","do","vr","za","zo"]
+    now_str = ms["now_nl"].strftime("%H:%M")
+    st.markdown(
+        f'<div style="background:#12161f;border:1.5px solid {ms["color"]}33;'
+        f'border-radius:8px;padding:10px 16px;margin-bottom:12px;'
+        f'display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
+        f'<span style="color:{ms["color"]};font-weight:700;font-size:.9rem">⬤ {ms["status"].upper()}</span>'
+        f'<span style="color:#e2e8f0;font-size:.85rem">{ms["msg"]}</span>'
+        f'<span style="color:#475569;font-size:.75rem">NL-tijd: {now_str}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
 
     # ── EUR/USD koers ─────────────────────────────────────────────────────────
@@ -749,98 +1259,137 @@ elif page == "Investeer Advies":
                             unsafe_allow_html=True,
                         )
 
+                    # 48u forecast berekenen
+                    hist_sig  = fetch_history(ticker, "1mo")
+                    fc        = {}
+                    if not hist_sig.empty:
+                        fc = forecast_48h(hist_sig["Close"].squeeze())
+
+                    richting      = fc.get("richting", "onbekend")
+                    verwacht_pct  = fc.get("verwachting_pct", 0.0)
+                    t_laag        = fc.get("target_laag")
+                    t_hoog        = fc.get("target_hoog")
+                    onderbouwing  = fc.get("onderbouwing", "")
+
+                    richting_icon  = {"omhoog": "▲", "omlaag": "▼", "neutraal": "►"}.get(richting, "?")
+                    richting_color = {"omhoog": "#4ade80", "omlaag": "#f87171", "neutraal": "#60a5fa"}.get(richting, "#94a3b8")
+                    bereik_str     = f"${t_laag:.2f} – ${t_hoog:.2f}" if t_laag and t_hoog else "—"
+
                     # Advies-box
                     st.markdown(
                         f'<div class="card" style="margin-bottom:4px">'
+                        f'<div style="margin-bottom:6px">'
                         f'Met <b>€{budget_eur:,.2f}</b> kun je maximaal '
                         f'<b>{max_shares:.4f} aandelen {ticker}</b> kopen '
                         f'(≈ ${cost_usd:,.2f} / €{cost_eur:,.2f}) '
                         f'· BB Laag: ${sig["lower_bb"]:.2f} · BB Hoog: ${sig["upper_bb"]:.2f}'
+                        f'</div>'
+                        f'<div style="margin-top:6px;font-size:.78rem;'
+                        f'color:{"#4ade80" if ms["is_open"] else "#fb923c"};font-weight:600">'
+                        f'{"⬤ Markt open — order wordt direct uitgevoerd" if ms["is_open"] else "⏸ Markt gesloten — order wordt uitgevoerd op " + ms["next_open_nl"].strftime("%a %d %b om %H:%M") + " NL-tijd"}'
+                        f'</div>'
+                        f'<div style="border-top:1px solid #1e2436;padding-top:8px;margin-top:4px">'
+                        f'<span style="font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em">48u verwachting</span>&nbsp;&nbsp;'
+                        f'<span style="color:{richting_color};font-weight:700">{richting_icon} {richting.upper()}</span>'
+                        f'&nbsp;<span style="color:{richting_color}">{verwacht_pct:+.1f}%</span>'
+                        f'&nbsp;&nbsp;<span style="color:#64748b;font-size:.8rem">Bereik: {bereik_str}</span>'
+                        f'<br><span style="font-size:.72rem;color:#475569">{onderbouwing}</span>'
+                        f'</div>'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
 
-                    # Opvolg-knoppen (alleen zichtbaar als nog pending)
+                    # Opvolg-sectie
                     if outcome == "pending":
-                        btn_col1, btn_col2, _ = st.columns([1.5, 1.5, 4])
-                        follow  = btn_col1.button("✓ Advies gevolgt",     key=f"follow_{advice_id}")
-                        no_follow = btn_col2.button("✗ Niet gevolgt",     key=f"nope_{advice_id}")
+                        st.markdown(
+                            '<div style="background:#0c1a0c;border:1px solid #14532d;'
+                            'border-radius:8px;padding:14px 16px;margin:6px 0">',
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown("**Heb je dit advies gevolgd?**")
 
-                        if no_follow:
-                            upsert_advice({
-                                "advice_id":      advice_id,
-                                "timestamp":      datetime.now().isoformat(),
-                                "ticker":         ticker,
-                                "budget_eur":     budget_eur,
-                                "budget_usd":     round(budget_usd, 2),
-                                "advised_price_usd": price_usd,
-                                "advised_price_eur": round(price_eur, 4),
-                                "advised_shares": round(max_shares, 8),
-                                "rsi_at_advice":  sig["rsi"],
-                                "outcome":        "niet_gevolgt",
-                                "actual_price_usd": None,
-                                "actual_shares":    None,
-                            })
-                            st.rerun()
-
-                        if follow:
-                            st.session_state[f"enter_price_{advice_id}"] = True
-
-                    # Prijsinvulformulier na "Gevolgt" klik
-                    if st.session_state.get(f"enter_price_{advice_id}") and outcome == "pending":
                         with st.form(f"form_actual_{advice_id}"):
-                            st.markdown(f"**Transactie invoeren — {ticker}**")
                             fc1, fc2 = st.columns(2)
                             with fc1:
                                 actual_price = st.number_input(
-                                    "Aankooprijs ($)", min_value=0.01,
-                                    value=round(price_usd, 2), step=0.01, format="%.4f",
+                                    f"Aankooprijs {ticker} ($)",
+                                    min_value=0.0001,
+                                    value=round(price_usd, 4),
+                                    step=0.01,
+                                    format="%.4f",
                                 )
                             with fc2:
                                 actual_shares = st.number_input(
-                                    "Aantal aandelen gekocht", min_value=0.00000001,
-                                    value=round(max_shares, 8), step=0.00000001, format="%.8f",
+                                    "Aantal aandelen gekocht",
+                                    min_value=0.00000001,
+                                    value=round(max_shares, 8),
+                                    step=0.00000001,
+                                    format="%.8f",
                                 )
-                            if st.form_submit_button("Opslaan & toevoegen aan portfolio"):
-                                # Sla advies op als gevolgt
-                                upsert_advice({
-                                    "advice_id":         advice_id,
-                                    "timestamp":         datetime.now().isoformat(),
-                                    "ticker":            ticker,
-                                    "budget_eur":        budget_eur,
-                                    "budget_usd":        round(budget_usd, 2),
-                                    "advised_price_usd": price_usd,
-                                    "advised_price_eur": round(price_eur, 4),
-                                    "advised_shares":    round(max_shares, 8),
-                                    "rsi_at_advice":     sig["rsi"],
-                                    "outcome":           "gevolgt",
-                                    "actual_price_usd":  actual_price,
-                                    "actual_shares":     actual_shares,
-                                })
-                                # Voeg toe aan portfolio (gemiddeld als al aanwezig)
-                                if ticker in portfolio:
-                                    old   = portfolio[ticker]
-                                    total_shares = old["shares"] + actual_shares
-                                    avg_price    = (
-                                        (old["shares"] * old["avg_price"] + actual_shares * actual_price)
-                                        / total_shares
+
+                            sb1, sb2 = st.columns([2, 1])
+                            with sb1:
+                                if st.form_submit_button(
+                                    f"✓ Ja, ik heb {ticker} gekocht — opslaan",
+                                    use_container_width=True,
+                                ):
+                                    upsert_advice({
+                                        "advice_id":         advice_id,
+                                        "timestamp":         datetime.now().isoformat(),
+                                        "ticker":            ticker,
+                                        "budget_eur":        budget_eur,
+                                        "budget_usd":        round(budget_usd, 2),
+                                        "advised_price_usd": price_usd,
+                                        "advised_price_eur": round(price_eur, 4),
+                                        "advised_shares":    round(max_shares, 8),
+                                        "rsi_at_advice":     sig["rsi"],
+                                        "outcome":           "gevolgt",
+                                        "actual_price_usd":  actual_price,
+                                        "actual_shares":     actual_shares,
+                                    })
+                                    # Voeg toe aan portfolio (gemiddeld als al aanwezig)
+                                    if ticker in portfolio:
+                                        old          = portfolio[ticker]
+                                        total_shares = old["shares"] + actual_shares
+                                        avg_price    = (
+                                            (old["shares"] * old["avg_price"] + actual_shares * actual_price)
+                                            / total_shares
+                                        )
+                                        portfolio[ticker]["shares"]    = round(total_shares, 8)
+                                        portfolio[ticker]["avg_price"] = round(avg_price, 4)
+                                    else:
+                                        portfolio[ticker] = {
+                                            "shares":    round(actual_shares, 8),
+                                            "avg_price": round(actual_price, 4),
+                                            "added":     datetime.now().isoformat(),
+                                        }
+                                    save_portfolio(portfolio)
+                                    fetch_quotes.clear()
+                                    st.success(
+                                        f"✓ {actual_shares:.8f} {ticker} @ ${actual_price:.4f} "
+                                        f"toegevoegd aan portfolio."
                                     )
-                                    portfolio[ticker]["shares"]    = round(total_shares, 8)
-                                    portfolio[ticker]["avg_price"] = round(avg_price, 4)
-                                else:
-                                    portfolio[ticker] = {
-                                        "shares":    round(actual_shares, 8),
-                                        "avg_price": round(actual_price, 4),
-                                        "added":     datetime.now().isoformat(),
-                                    }
-                                save_portfolio(portfolio)
-                                fetch_quotes.clear()
-                                del st.session_state[f"enter_price_{advice_id}"]
-                                st.success(
-                                    f"✓ {actual_shares:.8f} {ticker} @ ${actual_price:.4f} "
-                                    f"toegevoegd aan portfolio."
-                                )
-                                st.rerun()
+                                    st.rerun()
+
+                            with sb2:
+                                if st.form_submit_button("✗ Niet gevolgd", use_container_width=True):
+                                    upsert_advice({
+                                        "advice_id":         advice_id,
+                                        "timestamp":         datetime.now().isoformat(),
+                                        "ticker":            ticker,
+                                        "budget_eur":        budget_eur,
+                                        "budget_usd":        round(budget_usd, 2),
+                                        "advised_price_usd": price_usd,
+                                        "advised_price_eur": round(price_eur, 4),
+                                        "advised_shares":    round(max_shares, 8),
+                                        "rsi_at_advice":     sig["rsi"],
+                                        "outcome":           "niet_gevolgt",
+                                        "actual_price_usd":  None,
+                                        "actual_shares":     None,
+                                    })
+                                    st.rerun()
+
+                        st.markdown('</div>', unsafe_allow_html=True)
 
                     st.markdown("<hr style='border-color:#1e2436;margin:8px 0'>", unsafe_allow_html=True)
 
@@ -984,12 +1533,42 @@ elif page == "Transacties":
     else:
         for ticker in list(portfolio.keys()):
             pos = portfolio[ticker]
-            c_a, c_b, c_c, c_d = st.columns([2, 2, 2, 1])
-            c_a.markdown(f"**{ticker}**")
-            c_b.markdown(f"{pos['shares']} aandelen")
-            c_c.markdown(f"@ ${pos['avg_price']:.2f}")
-            if c_d.button("Verwijder", key=f"del_{ticker}"):
-                del portfolio[ticker]
-                save_portfolio(portfolio)
-                fetch_quotes.clear()
-                st.rerun()
+
+            with st.expander(f"**{ticker}** — {pos['shares']} aandelen @ ${pos['avg_price']:.4f}", expanded=False):
+                with st.form(f"edit_{ticker}"):
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        edit_shares = st.number_input(
+                            "Totaal aantal aandelen",
+                            min_value=0.0,
+                            value=float(pos["shares"]),
+                            step=0.00000001,
+                            format="%.8f",
+                        )
+                    with ec2:
+                        edit_price = st.number_input(
+                            "Gemiddelde inkoopprijs ($)",
+                            min_value=0.0,
+                            value=float(pos["avg_price"]),
+                            step=0.0001,
+                            format="%.4f",
+                        )
+
+                    sb1, sb2 = st.columns([2, 1])
+                    with sb1:
+                        if st.form_submit_button("Opslaan", use_container_width=True):
+                            if edit_shares > 0 and edit_price > 0:
+                                portfolio[ticker]["shares"]    = round(edit_shares, 8)
+                                portfolio[ticker]["avg_price"] = round(edit_price, 4)
+                                save_portfolio(portfolio)
+                                fetch_quotes.clear()
+                                st.success(f"✓ {ticker} bijgewerkt: {edit_shares} aandelen @ ${edit_price:.4f}")
+                                st.rerun()
+                            else:
+                                st.error("Aandelen en prijs moeten groter zijn dan 0.")
+                    with sb2:
+                        if st.form_submit_button("Verwijder positie", use_container_width=True):
+                            del portfolio[ticker]
+                            save_portfolio(portfolio)
+                            fetch_quotes.clear()
+                            st.rerun()

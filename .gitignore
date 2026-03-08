@@ -3,6 +3,8 @@ portfolio.json
 signals.json
 advice_log.json
 dashboard_password.txt
+last_signals.json
+settings.json
 __pycache__/
 *.pyc
 .env
