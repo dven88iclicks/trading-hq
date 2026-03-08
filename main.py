@@ -228,11 +228,11 @@ def load_portfolio() -> dict:
     # Werkelijk portfolio — exacte posities per 2025-03-08
     _now = datetime.now().isoformat()
     return {
-        "MRCY": {"shares": 4.38356102, "avg_price": 89.43, "buy_date": "2024-09-01",
+        "MRCY": {"shares": 4.38356102, "avg_price": 89.43,  "buy_date": "2024-09-01",
                  "added": _now, "status": "ACTIEF"},
-        "ARRY": {"shares": 13.00,      "avg_price": 6.81,  "buy_date": "2025-03-08",
+        "ARRY": {"shares": 17.51,      "avg_price": 6.81,   "buy_date": "2025-03-08",
                  "added": _now, "status": "PENDING"},
-        "FUBO": {"shares": 11.00,      "avg_price": 1.18,  "buy_date": "2025-03-08",
+        "FUBO": {"shares": 191.67,     "avg_price": 1.20,   "buy_date": "2025-03-08",
                  "added": _now, "status": "PENDING"},
     }
 
@@ -733,12 +733,14 @@ def _run_scan_inner() -> list:
             avg_price  = float(pos.get("avg_price") or 0)
             profit_pct = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
 
-            # Verkoop-trigger: ALLEEN RSI > 70 (overbought) voor actieve posities
-            should_sell = rsi_val > 70
+            # Verkoop-trigger: RSI > 70 EN prijs boven minimale winstdrempel per ticker
+            _sell_floor = {"MRCY": 94.00}.get(ticker, 0.0)  # per-ticker minimumprijs
+            should_sell = rsi_val > 70 and (cur_price > _sell_floor if _sell_floor else True)
 
             if should_sell and not _recently_alerted(ticker, "VERKOOP"):
                 pnl_usd     = (cur_price - avg_price) * float(pos.get("shares", 0))
-                sell_reason = f"RSI overbought ({rsi_val:.0f})"
+                _floor_txt  = f" · prijs > ${_sell_floor:.2f}" if _sell_floor else ""
+                sell_reason = f"RSI overbought ({rsi_val:.0f}){_floor_txt}"
                 markt = (
                     "⏸ Markt gesloten — uitvoering bij opening"
                     if not ms["is_open"]
@@ -1026,6 +1028,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── PWA / iPhone "Voeg toe aan beginscherm" meta-tags ─────────────────────────
+st.markdown("""
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Trading HQ">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0f1117">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="/app/static/manifest.json">
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%230f1117'/><text y='.9em' font-size='80'>📈</text></svg>">
+""", unsafe_allow_html=True)
 
 start_watcher_once()
 
@@ -1424,8 +1438,18 @@ if page == "Portfolio & P&L":
                     else:
                         sig_data = {"signal": "DATA_ERROR", "rsi": None,
                                     "upper_bb": None, "lower_bb": None}
-                    current_price = _display_price  # gebruik fallback voor verdere berekeningen
+                    current_price  = _display_price  # gebruik fallback voor verdere berekeningen
                     signal         = sig_data.get("signal", "?")
+
+                    # Earnings Protector — waarschuwing als cijfers binnen 7 dagen
+                    _earnings_soon = _earnings_within_days(ticker, 7)
+                    _earnings_date = _get_earnings_date(ticker)
+                    if _earnings_soon and _earnings_date:
+                        st.warning(
+                            f"⚠️ **Earnings binnen 7 dagen** — {ticker} publiceert "
+                            f"cijfers op **{_earnings_date}**. BUY-alerts worden geblokkeerd.",
+                            icon=None,
+                        )
 
                     # P&L: toon $0.00 voor PENDING (order nog niet bevestigd)
                     if _is_pending:
@@ -1661,6 +1685,14 @@ elif page == "Markt Scan":
         st.warning("Geen scanresultaten. Probeer opnieuw via 'Nu Scannen' in de sidebar.")
     else:
         emoji_map = {"BUY": "🟢", "STRONG BUY": "💎", "SELL": "🔴", "HOLD": "🔵"}
+
+        # Haal analyst-data op voor BUY/STRONG BUY tickers (gecached, max ~10 calls)
+        _buy_tickers = [s["ticker"] for s in scan_results
+                        if s.get("signal") in ("BUY", "STRONG BUY") and s.get("ticker")]
+        _pt_cache: dict = {}
+        for _bt in _buy_tickers[:10]:
+            _pt_cache[_bt] = fetch_price_targets(_bt)
+
         rows = []
         for s in scan_results:
             signal   = s.get("signal", "?")
@@ -1668,6 +1700,11 @@ elif page == "Markt Scan":
             price    = s.get("price")
             trend_ok = (sma200 is None) or (price and price > sma200)
             vol_tag  = " ⚡" if s.get("vol_surge") else ""
+            _pt      = _pt_cache.get(s.get("ticker"), {})
+            _rec     = (_pt.get("recommendation") or "—") if _pt else "—"
+            _upside  = _pt.get("target_1y_pct") if _pt else None
+            _upside_str = (f"{'▲' if _upside >= 0 else '▼'}{abs(_upside):.0f}%"
+                           if _upside is not None else "—")
             rows.append({
                 " ":            emoji_map.get(signal, "⚪"),
                 "Ticker":       s.get("ticker", "?"),
@@ -1678,6 +1715,8 @@ elif page == "Markt Scan":
                 "BB Hoog":      f"${s['upper_bb']:.2f}"  if s.get("upper_bb") else "—",
                 "BB Laag":      f"${s['lower_bb']:.2f}"  if s.get("lower_bb") else "—",
                 "Signaal":      signal + vol_tag,
+                "Aanbeveling":  _rec,
+                "Upside 1j":    _upside_str,
                 "Portfolio":    "✓" if s.get("ticker") in portfolio else "",
             })
 
