@@ -608,6 +608,7 @@ def run_scan() -> list:
             telegram_send(msg)
             tg_label = "KOOP" if signal == "BUY" else "VERKOOP"
             last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": tg_label})
+            save_last_signals(last_signals)   # direct opslaan na elke send
 
         # ── Koopkans buiten portfolio (budget > 0, markt open, RSI < 25) ─────
         elif (ticker not in portfolio and budget > 0 and ms["is_open"]
@@ -619,9 +620,10 @@ def run_scan() -> list:
                 f"Prijs: ${sig['price']:.2f}  ·  Onderste BB: ${sig['lower_bb']:.2f}"
             )
             last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": "KOOPKANS"})
+            save_last_signals(last_signals)   # direct opslaan na elke send
 
+    # Sla altijd de laatste bekende state op (ook niet-gealerteerde tickers bijwerken)
     save_last_signals(last_signals)
-
     return results
 
 
@@ -894,9 +896,9 @@ with st.sidebar:
     st.divider()
 
     if st.button("🔄 Nu Scannen", use_container_width=True):
-        fetch_scan.clear()
         with st.spinner("Scannen..."):
-            run_scan()
+            fetch_scan.clear()
+            fetch_scan()   # één aanroep, result wordt gecached — geen tweede run via rerun()
         st.success("Scan voltooid.")
         st.rerun()
 
