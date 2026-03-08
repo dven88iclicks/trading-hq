@@ -167,6 +167,53 @@ _scan_lock       = threading.Lock()   # voorkomt gelijktijdige scan-runs
 _watcher_started = False
 
 
+# Module-level earnings cache (thread-safe via _lock, TTL 24 uur)
+_earnings_cache: dict = {}   # {ticker: (fetched_at: datetime, earnings_date: date | None)}
+
+
+def _get_earnings_date(ticker: str):
+    """
+    Haal de eerstvolgende earnings date op via yfinance calendar.
+    Gecached 24 uur in geheugen. Geeft None terug als onbekend of fout.
+    """
+    with _lock:
+        cached = _earnings_cache.get(ticker)
+    if cached:
+        fetched_at, ed = cached
+        if (datetime.now() - fetched_at).total_seconds() < 86400:
+            return ed
+    ed = None
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if cal is None:
+            pass
+        elif isinstance(cal, dict):
+            dates = cal.get("Earnings Date") or cal.get("earningsDate") or []
+            if dates:
+                ed = pd.Timestamp(dates[0]).date()
+        elif isinstance(cal, pd.DataFrame) and not cal.empty:
+            col = cal.get("Earnings Date") or cal.iloc[:, 0]
+            if col is not None and len(col):
+                ed = pd.Timestamp(col.iloc[0]).date()
+    except Exception:
+        ed = None
+    with _lock:
+        _earnings_cache[ticker] = (datetime.now(), ed)
+    return ed
+
+
+def _earnings_within_days(ticker: str, days: int = 7) -> bool:
+    """True als er een earnings-datum bekend is binnen 'days' kalenderdagen."""
+    try:
+        ed = _get_earnings_date(ticker)
+        if ed is None:
+            return False
+        delta = (ed - date.today()).days
+        return 0 <= delta <= days
+    except Exception:
+        return False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA PERSISTENCE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -447,16 +494,18 @@ def forecast_48h(close: pd.Series) -> dict:
     }
 
 
-def compute_signal(close: pd.Series) -> dict:
+def compute_signal(close: pd.Series, volume: pd.Series = None) -> dict:
     """
-    Professionele signaalberekening met kwaliteitsfilters:
-    - BUY  : RSI < 30 ÉN prijs ≤ onderste BB (2σ) ÉN prijs boven SMA-200 ÉN prijs ≥ $5
-    - SELL : RSI > 70 ÉN prijs ≥ bovenste BB  (beide voorwaarden — exit via scanner)
-    - HOLD : alles daartussenin of filters niet gehaald
+    Institutional-grade signaalberekening:
+    - STRONG BUY : RSI < 30 + prijs ≤ BB-laag + prijs ≥ $5 + prijs > SMA-200
+                   + volume > 1.2× 10-daags gemiddelde  (volume-bevestiging)
+    - BUY        : zelfde als STRONG BUY maar zonder volume-bevestiging
+    - SELL       : RSI > 70 ÉN prijs ≥ bovenste BB
+    - HOLD       : alles daartussenin of filters niet gehaald
     """
     if len(close) < 20:
         return {"signal": "DATA_ERROR", "rsi": None, "upper_bb": None, "lower_bb": None,
-                "price": None, "sma200": None}
+                "price": None, "sma200": None, "vol_surge": False}
 
     current   = float(close.iloc[-1])
     rsi_val   = float(calc_rsi(close).iloc[-1])
@@ -464,30 +513,38 @@ def compute_signal(close: pd.Series) -> dict:
     upper_val = float(upper.iloc[-1])
     lower_val = float(lower.iloc[-1])
 
-    # SMA-200: alleen beschikbaar als we >= 200 datapunten hebben
+    # SMA-200
     _sma200_raw = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
     sma200_val  = _sma200_raw if (_sma200_raw and not np.isnan(_sma200_raw)) else None
 
     # Kwaliteitsfilter: geen penny stocks
     price_ok = current >= 5.0
-
-    # Trend filter: prijs boven SMA-200 (skip als onvoldoende data)
+    # Trend filter: prijs boven SMA-200
     trend_ok = (sma200_val is None) or (current > sma200_val)
 
+    # Volume-validatie: volume > 1.2× 10-daags gemiddelde
+    vol_surge = False
+    if volume is not None and len(volume) >= 11:
+        avg_vol_10d = float(volume.iloc[-11:-1].mean())
+        today_vol   = float(volume.iloc[-1])
+        if avg_vol_10d > 0:
+            vol_surge = today_vol > avg_vol_10d * 1.2
+
     if rsi_val < 30 and current <= lower_val and price_ok and trend_ok:
-        signal = "BUY"
+        signal = "STRONG BUY" if vol_surge else "BUY"
     elif rsi_val > 70 and current >= upper_val:
         signal = "SELL"
     else:
         signal = "HOLD"
 
     return {
-        "signal":   signal,
-        "price":    round(current, 4),
-        "rsi":      round(rsi_val, 1),
-        "upper_bb": round(upper_val, 2),
-        "lower_bb": round(lower_val, 2),
-        "sma200":   round(sma200_val, 2) if sma200_val else None,
+        "signal":    signal,
+        "price":     round(current, 4),
+        "rsi":       round(rsi_val, 1),
+        "upper_bb":  round(upper_val, 2),
+        "lower_bb":  round(lower_val, 2),
+        "sma200":    round(sma200_val, 2) if sma200_val else None,
+        "vol_surge": vol_surge,
     }
 
 
@@ -496,12 +553,23 @@ def _get_close(data: pd.DataFrame, ticker: str, multi: bool) -> pd.Series:
     if not multi:
         return data["Close"].dropna()
     try:
-        # yfinance 0.2.x group_by='ticker': df[ticker][field]
         return data[ticker]["Close"].dropna()
     except (KeyError, TypeError):
         try:
-            # Alternative structure: df[field][ticker]
             return data["Close"][ticker].dropna()
+        except Exception:
+            return pd.Series(dtype=float)
+
+
+def _get_volume(data: pd.DataFrame, ticker: str, multi: bool) -> pd.Series:
+    """Safely extract Volume series from a yfinance download result."""
+    if not multi:
+        return data["Volume"].dropna()
+    try:
+        return data[ticker]["Volume"].dropna()
+    except (KeyError, TypeError):
+        try:
+            return data["Volume"][ticker].dropna()
         except Exception:
             return pd.Series(dtype=float)
 
@@ -559,11 +627,18 @@ def _run_scan_inner() -> list:
 
     for ticker in WATCHLIST:
         try:
-            close = _get_close(raw, ticker, multi)
+            close  = _get_close(raw, ticker, multi)
+            volume = _get_volume(raw, ticker, multi)
             if len(close) < 20:
                 continue
-            sig             = compute_signal(close)
-            sig["ticker"]   = ticker
+            sig = compute_signal(close, volume)
+
+            # Earnings Protector: blokkeer BUY-signalen als earnings binnen 7 dagen
+            if sig["signal"] in ("BUY", "STRONG BUY") and _earnings_within_days(ticker, 7):
+                sig["signal"]           = "HOLD"
+                sig["earnings_warning"] = True
+
+            sig["ticker"]     = ticker
             sig["scanned_at"] = datetime.now().isoformat()
             results.append(sig)
         except Exception:
@@ -572,9 +647,11 @@ def _run_scan_inner() -> list:
     # Sorteer op RSI (laagste = meest oversold)
     results.sort(key=lambda x: x.get("rsi") or 50)
 
-    ms           = market_status()
-    last_signals = load_last_signals()
-    settings     = load_settings()
+    ms             = market_status()
+    last_signals   = load_last_signals()
+    settings       = load_settings()
+    market_ctx     = fetch_market_context()
+    market_bearish = market_ctx.get("sentiment") == "bearish"
     budget       = float(settings.get("budget_eur", 0))
     now          = datetime.now()
 
@@ -610,7 +687,7 @@ def _run_scan_inner() -> list:
         ticker = sig["ticker"]
         signal = sig.get("signal")
 
-        if signal in ("BUY", "SELL"):
+        if signal in ("BUY", "STRONG BUY", "SELL"):
             append_signal(sig)
 
         prev         = last_signals.get(ticker, {})
@@ -704,11 +781,11 @@ def _run_scan_inner() -> list:
 
         # ── Niet in portfolio — BUY/KOOPKANS logica ──────────────────────────
         # Markt dicht + geen actief signaal → overslaan
-        if not ms["is_open"] and signal not in ("BUY", "SELL"):
+        if not ms["is_open"] and signal not in ("BUY", "STRONG BUY", "SELL"):
             continue
 
-        # ── BUY: budget = 0 → alleen bij extreme kans, anders stilte ─────────
-        if signal == "BUY" and budget <= 0:
+        # ── BUY/STRONG BUY: budget = 0 → alleen bij extreme kans ─────────────
+        if signal in ("BUY", "STRONG BUY") and budget <= 0:
             if not _is_extreme(sig) or _recently_alerted(ticker, "EXTREME BUY"):
                 continue
             telegram_send(
@@ -721,18 +798,28 @@ def _run_scan_inner() -> list:
             save_last_signals(last_signals)
             continue
 
-        # ── Koopkans buiten portfolio (budget > 0, markt open, RSI < 25) ─────
-        # Kwaliteitsfilter: geen penny stocks (< $5) + trend boven SMA-200 al in compute_signal
+        # ── Koopkans / Strong Buy buiten portfolio (budget > 0, markt open) ──
+        # Bij bearish markt (SPY/ITA rood > 1%): alleen STRONG BUY adviezen
+        if market_bearish and signal == "BUY":
+            continue
         if (budget > 0 and ms["is_open"]
-                and (sig.get("rsi") or 50) < 25
+                and signal in ("BUY", "STRONG BUY")
                 and (sig.get("price") or 0) >= 5.0
-                and not _recently_alerted(ticker, "KOOPKANS")):
-            telegram_send(
-                f"\U0001f7e2 <b>KOOPKANS: {ticker}</b>\n"
-                f"RSI: {sig['rsi']} (sterk oversold)\n"
-                f"Prijs: ${sig['price']:.2f}  ·  Onderste BB: ${sig['lower_bb']:.2f}"
-            )
-            last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": "KOOPKANS"})
+                and not _recently_alerted(ticker, signal)):
+            if signal == "STRONG BUY":
+                telegram_send(
+                    f"💎 <b>STRONG BUY: {ticker}</b>\n"
+                    f"RSI: {sig['rsi']} (sterk oversold) + volume-surge bevestigd\n"
+                    f"Prijs: ${sig['price']:.2f}  ·  BB Laag: ${sig['lower_bb']:.2f}\n"
+                    f"Volume > 1.2× 10-daags gemiddelde — institutioneel koopsignaal."
+                )
+            else:
+                telegram_send(
+                    f"\U0001f7e2 <b>KOOPKANS: {ticker}</b>\n"
+                    f"RSI: {sig['rsi']} (sterk oversold)\n"
+                    f"Prijs: ${sig['price']:.2f}  ·  Onderste BB: ${sig['lower_bb']:.2f}"
+                )
+            last_signals[ticker].update({"alerted": True, "sent_at": now.isoformat(), "last_telegram": signal})
             save_last_signals(last_signals)
 
     # Sla altijd de laatste bekende state op (ook niet-gealerteerde tickers bijwerken)
@@ -834,11 +921,13 @@ def fetch_price_targets(ticker: str) -> dict:
         if not current:
             current = full_info.get("currentPrice") or full_info.get("regularMarketPrice")
 
+        beta = full_info.get("beta")
         result["n_analysts"]    = int(n_analysts)
         result["recommendation"] = rec_nl
-        result["target_1y"]     = round(target_1y, 2)   if target_1y     else None
+        result["target_1y"]     = round(target_1y, 2)      if target_1y      else None
         result["target_1y_high"]= round(target_1y_high, 2) if target_1y_high else None
         result["target_1y_low"] = round(target_1y_low, 2)  if target_1y_low  else None
+        result["beta"]          = round(float(beta), 2)    if beta is not None else None
 
         if current and target_1y:
             move = target_1y - current
@@ -866,6 +955,54 @@ def fetch_price_targets(ticker: str) -> dict:
         pass
 
     result["current"] = current
+    return result
+
+
+@st.cache_data(ttl=300)
+def fetch_market_context() -> dict:
+    """
+    Haal marktcontext op: S&P 500 (SPY) en Defense Sector (ITA).
+    Geeft dagelijkse % verandering terug.  Gecached 5 min.
+    """
+    result = {}
+    try:
+        raw = yf.download(
+            ["SPY", "ITA"], period="5d", interval="1d",
+            group_by="ticker", progress=False, threads=True,
+        )
+        multi = True
+        for sym in ["SPY", "ITA"]:
+            try:
+                close = _get_close(raw, sym, multi).dropna()
+                if len(close) >= 2:
+                    prev  = float(close.iloc[-2])
+                    last  = float(close.iloc[-1])
+                    chg   = (last - prev) / prev * 100
+                    result[sym] = {
+                        "price":      round(last, 2),
+                        "change_pct": round(chg, 2),
+                        "is_up":      chg >= 0,
+                    }
+            except Exception:
+                result[sym] = None
+    except Exception:
+        pass
+    # Bepaal overall marktsentiment
+    spy = result.get("SPY")
+    ita = result.get("ITA")
+    if spy and ita:
+        avg_chg = (spy["change_pct"] + ita["change_pct"]) / 2
+        if avg_chg <= -1.0:
+            sentiment = "bearish"
+        elif avg_chg >= 0.5:
+            sentiment = "bullish"
+        else:
+            sentiment = "neutraal"
+    elif spy:
+        sentiment = "bearish" if spy["change_pct"] <= -1.0 else ("bullish" if spy["change_pct"] >= 0.5 else "neutraal")
+    else:
+        sentiment = "onbekend"
+    result["sentiment"] = sentiment
     return result
 
 
@@ -926,6 +1063,21 @@ div[data-testid="stExpander"] > div { background:#12161f !important; }
     border-radius:999px; font-size:.75rem; font-weight:700; }
 .badge-hold { background:#1e2d3d; color:#60a5fa; padding:3px 10px;
     border-radius:999px; font-size:.75rem; font-weight:700; }
+.badge-strong { background:#052e16; color:#4ade80; padding:3px 10px;
+    border-radius:999px; font-size:.75rem; font-weight:700;
+    border:1px solid #4ade80; letter-spacing:.04em; }
+.risk-bar { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:2px; }
+.market-bull { color:#4ade80; font-weight:700; }
+.market-bear { color:#f87171; font-weight:700; }
+.market-neutral { color:#94a3b8; font-weight:700; }
+/* Form submit buttons — dark theme */
+[data-testid="stFormSubmitButton"] button {
+    background:#1e2d3d !important; color:#e2e8f0 !important;
+    border:1px solid #334155 !important; border-radius:6px !important;
+    font-weight:600 !important; }
+[data-testid="stFormSubmitButton"] button:hover {
+    background:#263548 !important; border-color:#60a5fa !important;
+    color:#f1f5f9 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1039,6 +1191,37 @@ with st.sidebar:
     st.caption("Automatische scan elke 30 min.")
     st.divider()
 
+    # ── Market Context widget ─────────────────────────────────────────────────
+    st.markdown("**Market Context**")
+    _mc = fetch_market_context()
+    _sentiment = _mc.get("sentiment", "onbekend")
+    _sent_color = {"bullish": "#4ade80", "bearish": "#f87171",
+                   "neutraal": "#94a3b8", "onbekend": "#475569"}.get(_sentiment, "#475569")
+    _sent_icon  = {"bullish": "▲", "bearish": "▼", "neutraal": "►"}.get(_sentiment, "?")
+    st.markdown(
+        f'<div style="background:#0c0f16;border:1px solid #1e2436;border-radius:6px;padding:8px 10px;font-size:.78rem">'
+        f'<div style="color:{_sent_color};font-weight:700;margin-bottom:4px">{_sent_icon} {_sentiment.upper()}</div>',
+        unsafe_allow_html=True,
+    )
+    for _sym in ["SPY", "ITA"]:
+        _d = _mc.get(_sym)
+        if _d:
+            _c = "#4ade80" if _d["is_up"] else "#f87171"
+            _arrow = "▲" if _d["is_up"] else "▼"
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;font-size:.72rem">'
+                f'<span style="color:#64748b">{_sym}</span>'
+                f'<span style="color:{_c}">${_d["price"]:,.2f} {_arrow}{abs(_d["change_pct"]):.2f}%</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(f'<div style="font-size:.72rem;color:#475569">{_sym}: —</div>', unsafe_allow_html=True)
+    if _sentiment == "bearish":
+        st.markdown('<div style="margin-top:4px;font-size:.68rem;color:#f87171">⚠️ Rode markt — bot extra voorzichtig</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.divider()
+
     if st.button("🚪 Uitloggen", use_container_width=True):
         _tok = st.session_state.get("_session_token")
         if _tok:
@@ -1057,11 +1240,29 @@ portfolio = load_portfolio()
 # ══════════════════════════════════════════════════════════════════════════════
 
 if page == "Portfolio & P&L":
-    st.markdown("## 📊 Portfolio & P&L")
+    _hdr_l, _hdr_r = st.columns([3, 1])
+    _hdr_l.markdown("## 📊 Portfolio & P&L")
+    with _hdr_r:
+        _eur_on = st.toggle("🇪🇺 Euro's", key="eur_toggle", value=st.session_state.get("eur_toggle", False))
 
     if not portfolio:
         st.info("Geen posities. Voeg ze toe via 'Transacties'.")
         st.stop()
+
+    # ── Valuta-hulpfuncties ───────────────────────────────────────────────────
+    _eur_rate = fetch_eur_usd() if _eur_on else 1.0
+    _ccy      = "€" if _eur_on else "$"
+
+    def _c(usd: float) -> float:
+        """Converteer USD naar geselecteerde valuta."""
+        return usd / _eur_rate
+
+    def _fmt(usd: float, sign: bool = False) -> str:
+        v = _c(usd)
+        return (f"{_ccy}{v:+,.2f}" if sign else f"{_ccy}{v:,.2f}")
+
+    if _eur_on:
+        st.caption(f"Wisselkoers: 1 € = ${_eur_rate:.4f}  ·  Alle bedragen omgerekend naar euro's")
 
     tickers = list(portfolio.keys())
     prices  = fetch_quotes(tuple(sorted(tickers)))
@@ -1086,9 +1287,9 @@ if page == "Portfolio & P&L":
     total_pnl_pct = (total_pnl / pnl_cost * 100) if pnl_cost else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Totale Waarde",    f"${total_value:,.2f}")
-    c2.metric("Kosten Basis",     f"${total_cost:,.2f}")
-    c3.metric("Unrealized P&L",   f"${total_pnl:+,.2f}", f"{total_pnl_pct:+.1f}%")
+    c1.metric("Totale Waarde",    _fmt(total_value))
+    c2.metric("Kosten Basis",     _fmt(total_cost))
+    c3.metric("Unrealized P&L",   _fmt(total_pnl, sign=True), f"{total_pnl_pct:+.1f}%")
     c4.metric("Posities",         f"{len(_actief)} actief  ·  {len(_pending)} pending" if _pending else str(len(tickers)))
 
     st.divider()
@@ -1211,7 +1412,12 @@ if page == "Portfolio & P&L":
                     _status        = pos.get("status", "ACTIEF")
                     _is_pending    = _status == "PENDING"
                     huidige_waarde = current_price * pos["shares"]
-                    sig_data       = compute_signal(hist["Close"].squeeze())
+                    # Prefer stored scan result (uses 1y data) over recomputing from 1mo hist
+                    _stored_sig = load_last_signals().get(ticker, {})
+                    if _stored_sig and _stored_sig.get("signal") not in (None, "DATA_ERROR", "?"):
+                        sig_data = _stored_sig
+                    else:
+                        sig_data = compute_signal(hist["Close"].squeeze())
                     signal         = sig_data.get("signal", "?")
 
                     # P&L: toon $0.00 voor PENDING (order nog niet bevestigd)
@@ -1230,13 +1436,17 @@ if page == "Portfolio & P&L":
                     except Exception:
                         _dagen = 0
 
-                    badge_map = {"BUY": "buy", "SELL": "sell", "HOLD": "hold"}
+                    badge_map = {"BUY": "buy", "STRONG BUY": "strong", "SELL": "sell", "HOLD": "hold"}
                     # PENDING-posities tonen altijd "IN AFWACHTING" badge
                     if _is_pending:
                         badge_cls = "hold"
                         label     = "IN AFWACHTING"
+                    elif signal in ("DATA_ERROR", "?", None):
+                        badge_cls = "hold"
+                        label     = "LADEN..."
                     else:
-                        label_map = {"BUY": "BIJKOPEN", "SELL": "VERKOPEN", "HOLD": "VASTHOUDEN"}
+                        label_map = {"BUY": "BIJKOPEN", "STRONG BUY": "💎 STRONG BUY",
+                                     "SELL": "VERKOPEN", "HOLD": "VASTHOUDEN"}
                         badge_cls = badge_map.get(signal, "hold")
                         label     = label_map.get(signal, signal)
                     pnl_cls = "pnl-pos" if pnl_usd >= 0 else "pnl-neg"
@@ -1245,8 +1455,39 @@ if page == "Portfolio & P&L":
                         '<div style="font-size:.72rem;color:#fb923c;font-style:italic">'
                         'Wacht op marktopening —<br>berekening start bij eerste koersbeweging.</div>'
                         if _is_pending
-                        else f'<div class="{pnl_cls}">${pnl_usd:+.2f} ({pnl_pct:+.1f}%)</div>'
+                        else f'<div class="{pnl_cls}">{_fmt(pnl_usd, sign=True)} ({pnl_pct:+.1f}%)</div>'
                     )
+
+                    # Pre-fetch price targets for beta / upside display in card
+                    _pt_card   = fetch_price_targets(ticker)
+                    _beta      = (_pt_card or {}).get("beta")
+                    _upside    = (_pt_card or {}).get("target_1y_pct")
+                    # Risk score: beta → number of filled bars (1–5)
+                    if _beta is not None:
+                        _bars     = min(5, max(1, round(abs(_beta) * 2)))
+                        _bar_html = "".join(
+                            f'<span class="risk-bar" style="background:{"#f87171" if i < _bars else "#1e2436"}"></span>'
+                            for i in range(5)
+                        )
+                        _beta_lbl = "Laag" if abs(_beta) < 0.8 else ("Hoog" if abs(_beta) > 1.5 else "Gemiddeld")
+                        _risk_row = (
+                            f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Risico (Beta {_beta:.1f})</div>'
+                            f'<div style="margin-top:2px">{_bar_html} '
+                            f'<span style="font-size:.7rem;color:#94a3b8">{_beta_lbl}</span></div>'
+                        )
+                    else:
+                        _risk_row = ""
+                    # Analyst upside
+                    if _upside is not None:
+                        _up_color  = "#4ade80" if _upside >= 0 else "#f87171"
+                        _up_arrow  = "▲" if _upside >= 0 else "▼"
+                        _upside_row = (
+                            f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Analist koersdoel (1j)</div>'
+                            f'<div style="font-size:.9rem;font-weight:700;color:{_up_color}">'
+                            f'{_up_arrow} {abs(_upside):.1f}% upside</div>'
+                        )
+                    else:
+                        _upside_row = ""
 
                     st.markdown(f"""
                     <div class="card">
@@ -1255,11 +1496,11 @@ if page == "Portfolio & P&L":
                             {"&nbsp;<span style='font-size:.65rem;color:#fb923c;font-weight:600'>⏳ PENDING</span>" if _is_pending else ""}
                         </div>
                         <div style="font-size:.7rem;color:#64748b">Huidige prijs</div>
-                        <div style="font-size:1.3rem;font-weight:800;color:#f1f5f9">${current_price:.2f}</div>
+                        <div style="font-size:1.3rem;font-weight:800;color:#f1f5f9">{_fmt(current_price)}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Huidige waarde</div>
-                        <div style="font-size:1rem;font-weight:700;color:#60a5fa">${huidige_waarde:,.2f}</div>
+                        <div style="font-size:1rem;font-weight:700;color:#60a5fa">{_fmt(huidige_waarde)}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Gemiddelde inkoop</div>
-                        <div style="color:#94a3b8">${pos['avg_price']:.2f}</div>
+                        <div style="color:#94a3b8">{_fmt(pos['avg_price'])}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Aandelen</div>
                         <div style="color:#94a3b8">{pos['shares']}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Totale winst/verlies</div>
@@ -1267,9 +1508,11 @@ if page == "Portfolio & P&L":
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">Dagen in bezit</div>
                         <div style="color:#94a3b8">{_dagen} dagen</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">RSI (14)</div>
-                        <div style="font-size:1rem;color:#fb923c;font-weight:700">{sig_data.get('rsi', '—')}</div>
+                        <div style="font-size:1rem;color:#fb923c;font-weight:700">{sig_data.get('rsi') or '—'}</div>
                         <div style="font-size:.7rem;color:#64748b;margin-top:8px">BB Hoog / Laag</div>
-                        <div style="font-size:.8rem;color:#60a5fa">${sig_data.get('upper_bb', '—')} / ${sig_data.get('lower_bb', '—')}</div>
+                        <div style="font-size:.8rem;color:#60a5fa">{_fmt(sig_data['upper_bb']) if sig_data.get('upper_bb') else '—'} / {_fmt(sig_data['lower_bb']) if sig_data.get('lower_bb') else '—'}</div>
+                        {_risk_row}
+                        {_upside_row}
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -1296,17 +1539,17 @@ if page == "Portfolio & P&L":
                         )
 
                     # Koersdoelen sectie
-                    pt = fetch_price_targets(ticker)
+                    pt = _pt_card  # already fetched above
                     if pt:
-                        def _tgt_row(label, price, pct, color):
-                            if price is None:
+                        def _tgt_row(label, price_usd, pct, color):
+                            if price_usd is None:
                                 return f'<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>'
                             arrow = "▲" if (pct or 0) >= 0 else "▼"
                             return (
                                 f'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #1e2436">'
                                 f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
                                 f'<span style="font-size:.78rem;color:{color};font-weight:600">'
-                                f'${price:.2f} <span style="font-size:.68rem">{arrow}{abs(pct or 0):.1f}%</span></span>'
+                                f'{_fmt(price_usd)} <span style="font-size:.68rem">{arrow}{abs(pct or 0):.1f}%</span></span>'
                                 f'</div>'
                             )
 
@@ -1326,7 +1569,9 @@ if page == "Portfolio & P&L":
                                      "Houden": "#fb923c", "Verkopen": "#f87171",
                                      "Onderpresteren": "#f87171"}.get(rec, "#94a3b8")
 
-                        analyst_range = f"${t1yl:.2f} – ${t1yh:.2f}" if t1yl and t1yh else "—"
+                        analyst_range = (
+                            f"{_fmt(t1yl)} – {_fmt(t1yh)}" if t1yl and t1yh else "—"
+                        )
 
                         st.markdown(
                             f'<div class="card" style="margin-top:8px">'
@@ -1410,13 +1655,14 @@ elif page == "Markt Scan":
     if not scan_results:
         st.warning("Geen scanresultaten. Probeer opnieuw via 'Nu Scannen' in de sidebar.")
     else:
-        emoji_map = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🔵"}
+        emoji_map = {"BUY": "🟢", "STRONG BUY": "💎", "SELL": "🔴", "HOLD": "🔵"}
         rows = []
         for s in scan_results:
             signal   = s.get("signal", "?")
             sma200   = s.get("sma200")
             price    = s.get("price")
             trend_ok = (sma200 is None) or (price and price > sma200)
+            vol_tag  = " ⚡" if s.get("vol_surge") else ""
             rows.append({
                 " ":            emoji_map.get(signal, "⚪"),
                 "Ticker":       s.get("ticker", "?"),
@@ -1426,13 +1672,15 @@ elif page == "Markt Scan":
                 "Trend":        "↑" if trend_ok else "↓",
                 "BB Hoog":      f"${s['upper_bb']:.2f}"  if s.get("upper_bb") else "—",
                 "BB Laag":      f"${s['lower_bb']:.2f}"  if s.get("lower_bb") else "—",
-                "Signaal":      signal,
+                "Signaal":      signal + vol_tag,
                 "Portfolio":    "✓" if s.get("ticker") in portfolio else "",
             })
 
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        _n_strong = sum(1 for r in rows if "STRONG BUY" in r["Signaal"])
+        _n_buy    = sum(1 for r in rows if r["Signaal"].startswith("BUY"))
         st.caption(f"Gescand: {len(scan_results)} tickers  ·  "
-                   f"{sum(1 for r in rows if r['Signaal']=='BUY')} KOOP  ·  "
+                   f"{_n_strong} STRONG BUY  ·  {_n_buy} KOOP  ·  "
                    f"{sum(1 for r in rows if r['Signaal']=='SELL')} VERKOOP")
 
 
