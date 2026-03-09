@@ -1323,7 +1323,7 @@ if page == "Portfolio & P&L":
             with qc4:
                 qd = st.date_input("Aankoopdatum", value=date.today())
             with qc5:
-                qs = st.selectbox("Status", ["ACTIEF", "PENDING"])
+                qs = st.selectbox("Status", ["PENDING", "ACTIEF"])
             if st.form_submit_button("+ Toevoegen aan Portfolio", use_container_width=True):
                 if qt and qa > 0 and qp > 0:
                     if qt in portfolio:
@@ -2056,7 +2056,7 @@ elif page == "Transacties":
         with c4:
             new_date   = st.date_input("Aankoopdatum", value=date.today())
         with c5:
-            new_status = st.selectbox("Status", ["ACTIEF", "PENDING"])
+            new_status = st.selectbox("Status", ["PENDING", "ACTIEF"])
         if st.form_submit_button("Opslaan", use_container_width=True):
             if new_ticker and new_shares > 0 and new_price > 0:
                 if new_ticker in portfolio:
