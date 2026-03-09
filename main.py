@@ -2140,7 +2140,7 @@ elif page == "Transacties":
     if not portfolio:
         st.info("Nog geen posities.")
     else:
-        for ticker in list(portfolio.keys()):
+        for ticker in [k for k in portfolio.keys() if not k.startswith("_")]:
             pos = portfolio[ticker]
 
             _edit_status = pos.get("status", "ACTIEF")
