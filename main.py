@@ -1280,7 +1280,7 @@ if page == "Portfolio & P&L":
     if _eur_on:
         st.caption(f"Wisselkoers: 1 € = ${_eur_rate:.4f}  ·  Alle bedragen omgerekend naar euro's")
 
-    tickers = list(portfolio.keys())
+    tickers = [k for k in portfolio.keys() if not k.startswith("_")]
     prices  = fetch_quotes(tuple(sorted(tickers)))
 
     # ── Samenvatting ─────────────────────────────────────────────────────────
@@ -2140,7 +2140,7 @@ elif page == "Transacties":
     if not portfolio:
         st.info("Nog geen posities.")
     else:
-        for ticker in list(portfolio.keys()):
+        for ticker in [k for k in portfolio.keys() if not k.startswith("_")]:
             pos = portfolio[ticker]
 
             _edit_status = pos.get("status", "ACTIEF")
