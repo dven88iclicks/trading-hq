@@ -51,7 +51,7 @@ ADVICE_FILE         = Path("advice_log.json")
 LAST_SIGNALS_FILE   = Path("last_signals.json")
 SETTINGS_FILE       = Path("settings.json")
 SESSIONS_FILE       = Path("sessions.json")
-SCAN_INTERVAL       = 30 * 60  # seconds
+SCAN_INTERVAL       = 15 * 60  # seconds
 ALERT_COOLDOWN_H    = 6        # minimaal 6 uur tussen dezelfde alert per ticker
 SESSION_TIMEOUT_MIN = 10       # automatisch uitloggen na X minuten inactiviteit
 
@@ -225,14 +225,16 @@ def load_portfolio() -> dict:
                 return json.loads(PORTFOLIO_FILE.read_text())
             except Exception:
                 pass
-    # Werkelijk portfolio — exacte posities per 2025-03-08
+    # Werkelijk portfolio — exacte posities per 2026-03-09 (uit transactie-screenshots)
     _now = datetime.now().isoformat()
     return {
-        "MRCY": {"shares": 4.38356102, "avg_price": 89.43,  "buy_date": "2024-09-01",
+        "MRCY": {"shares": 4.38356102,   "avg_price": 89.43, "buy_date": "2024-09-01",
                  "added": _now, "status": "ACTIEF"},
-        "ARRY": {"shares": 17.51,      "avg_price": 6.81,   "buy_date": "2025-03-08",
+        "FUBO": {"shares": 198.27586206, "avg_price": 1.16,  "buy_date": "2026-03-09",
                  "added": _now, "status": "PENDING"},
-        "FUBO": {"shares": 191.67,     "avg_price": 1.20,   "buy_date": "2025-03-08",
+        "EVGO": {"shares": 89.93667860,  "avg_price": 2.169, "buy_date": "2026-03-09",
+                 "added": _now, "status": "PENDING"},
+        "ARRY": {"shares": 17.71771771,  "avg_price": 6.66,  "buy_date": "2026-03-09",
                  "added": _now, "status": "PENDING"},
     }
 
@@ -2110,6 +2112,26 @@ elif page == "Transacties":
                 st.success("Wachtwoord opgeslagen. Je wordt uitgelogd — log opnieuw in.")
                 st.session_state.authenticated = False
                 st.rerun()
+
+    st.divider()
+
+    # ── Portfolio herstellen ──────────────────────────────────────────────────
+    st.markdown("### Portfolio Herstellen")
+    st.caption("Overschrijf de huidige posities met de correcte waarden uit de transactie-screenshots.")
+    if st.button("🔄 Herstel naar correcte posities", use_container_width=True):
+        budget = portfolio.get("_budget_eur", 0)
+        _now = datetime.now().isoformat()
+        correct = {
+            "MRCY": {"shares": 4.38356102,   "avg_price": 89.43, "buy_date": "2024-09-01", "added": _now, "status": "ACTIEF"},
+            "FUBO": {"shares": 198.27586206,  "avg_price": 1.16,  "buy_date": "2026-03-09", "added": _now, "status": "PENDING"},
+            "EVGO": {"shares": 89.93667860,   "avg_price": 2.169, "buy_date": "2026-03-09", "added": _now, "status": "PENDING"},
+            "ARRY": {"shares": 17.71771771,   "avg_price": 6.66,  "buy_date": "2026-03-09", "added": _now, "status": "PENDING"},
+            "_budget_eur": budget,
+        }
+        save_portfolio(correct)
+        fetch_quotes.clear()
+        st.success("✓ Portfolio hersteld naar correcte waarden.")
+        st.rerun()
 
     st.divider()
 
