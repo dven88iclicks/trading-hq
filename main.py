@@ -580,17 +580,18 @@ def _get_volume(data: pd.DataFrame, ticker: str, multi: bool) -> pd.Series:
 # TELEGRAM
 # ══════════════════════════════════════════════════════════════════════════════
 
-def telegram_send(text: str) -> None:
+def telegram_send(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
+        return r.ok
     except Exception:
-        pass
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2112,6 +2113,39 @@ elif page == "Transacties":
                 st.success("Wachtwoord opgeslagen. Je wordt uitgelogd — log opnieuw in.")
                 st.session_state.authenticated = False
                 st.rerun()
+
+    st.divider()
+
+    # ── Test Telegram notificaties ────────────────────────────────────────────
+    st.markdown("### Test Telegram Notificaties")
+    st.caption("Stuur een testbericht om te verifiëren dat Telegram correct werkt.")
+    tc1, tc2 = st.columns(2)
+    with tc1:
+        if st.button("📩 Test KOOPKANS bericht", use_container_width=True):
+            ok = telegram_send(
+                "🟢 <b>[TEST] KOOPKANS: TESTSTOCK</b>\n"
+                "RSI: 28 (sterk oversold)\n"
+                "Prijs: $42.00  ·  Onderste BB: $41.50\n"
+                "<i>Dit is een testbericht — geen echte koop.</i>"
+            )
+            if ok:
+                st.success("✓ Test-BUY verstuurd naar Telegram.")
+            else:
+                st.error("✗ Verzenden mislukt. Controleer TELEGRAM_TOKEN en TELEGRAM_CHAT_ID.")
+    with tc2:
+        if st.button("📩 Test VERKOOP bericht", use_container_width=True):
+            ok = telegram_send(
+                "🔴 <b>[TEST] VERKOPEN: TESTSTOCK</b>\n"
+                "Reden: RSI overbought (75)\n"
+                "Prijs: <b>$44.00</b>  ·  RSI: 75\n"
+                "Positie: 10 aandelen @ $42.00\n"
+                "P&amp;L: <b>$+20.00 (+4.8%)</b>\n"
+                "<i>Dit is een testbericht — geen echte verkoop.</i>"
+            )
+            if ok:
+                st.success("✓ Test-VERKOOP verstuurd naar Telegram.")
+            else:
+                st.error("✗ Verzenden mislukt. Controleer TELEGRAM_TOKEN en TELEGRAM_CHAT_ID.")
 
     st.divider()
 
