@@ -404,6 +404,108 @@ def calc_bb(prices: pd.Series, period: int = 20, k: float = 2.0):
     return sma + k * sigma, sma, sma - k * sigma
 
 
+def _spark_svg(closes: list, width: int = 56, height: int = 18) -> str:
+    """Genereert een inline SVG sparkline van een lijst slotkoersen."""
+    if not closes or len(closes) < 2:
+        return '<svg width="56" height="18"></svg>'
+    mn, mx = min(closes), max(closes)
+    rng = mx - mn or 1
+    pts = []
+    for i, c in enumerate(closes):
+        x = round(i / (len(closes) - 1) * width, 1)
+        y = round(height - ((c - mn) / rng * (height - 2)) - 1, 1)
+        pts.append(f"{x},{y}")
+    trend_color = "#10B981" if closes[-1] >= closes[0] else "#EF4444"
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'xmlns="http://www.w3.org/2000/svg">'
+        f'<polyline points="{" ".join(pts)}" fill="none" stroke="{trend_color}" '
+        f'stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>'
+        f'</svg>'
+    )
+
+
+def _render_status_banner(ms: dict) -> None:
+    """Renders a pulsating market status banner."""
+    cls = "status-open" if ms["is_open"] else ("status-pre" if ms["status"] == "pre-market" else "status-closed")
+    st.markdown(
+        f'<div class="status-bar">'
+        f'<span class="status-live {cls}"></span>'
+        f'<span style="color:#F1F5F9;font-weight:600;font-size:.88rem">{ms["status"].upper()}</span>'
+        f'<span style="color:var(--text-muted);font-size:.82rem">{ms["msg"]}</span>'
+        f'<span style="color:var(--text-dim);font-size:.75rem">NL {ms["now_nl"].strftime("%H:%M")}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_risk_bar(beta) -> str:
+    """Returns HTML for a 5-bar risk indicator based on beta."""
+    if beta is None:
+        return ""
+    bars = min(5, max(1, round(abs(beta) * 2)))
+    bar_html = "".join(
+        f'<span class="risk-bar" style="background:{"#f87171" if i < bars else "#1e2436"}"></span>'
+        for i in range(5)
+    )
+    lbl = "Laag" if abs(beta) < 0.8 else ("Hoog" if abs(beta) > 1.5 else "Gemiddeld")
+    return (
+        f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Risico (Beta {beta:.1f})</div>'
+        f'<div style="margin-top:2px">{bar_html} '
+        f'<span style="font-size:.7rem;color:#94a3b8">{lbl}</span></div>'
+    )
+
+
+def _pct_row(label: str, pct, target) -> str:
+    """Returns an HTML row showing a percentage target."""
+    if target is None:
+        return (f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
+                f'border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">'
+                f'{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>')
+    color = "#4ade80" if (pct or 0) >= 0 else "#f87171"
+    arrow = "▲" if (pct or 0) >= 0 else "▼"
+    return (
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'padding:5px 0;border-bottom:1px solid #1e2436">'
+        f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
+        f'<span style="font-size:.82rem;color:{color};font-weight:700">'
+        f'{arrow} {abs(pct or 0):.1f}%'
+        f'<span style="font-size:.68rem;color:#94a3b8"> (${target:.2f})</span></span>'
+        f'</div>'
+    )
+
+
+def _tgt_row(label: str, price_usd, pct, color: str) -> str:
+    """Returns an HTML row showing an analyst price target."""
+    if price_usd is None:
+        return (f'<div style="display:flex;justify-content:space-between;padding:4px 0;'
+                f'border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">'
+                f'{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>')
+    arrow = "▲" if (pct or 0) >= 0 else "▼"
+    return (
+        f'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #1e2436">'
+        f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
+        f'<span style="font-size:.78rem;color:{color};font-weight:600">'
+        f'{_fmt(price_usd)} <span style="font-size:.68rem">{arrow}{abs(pct or 0):.1f}%</span></span>'
+        f'</div>'
+    )
+
+
+def _sig_html(signal: str, vol_surge: bool) -> str:
+    """Returns an HTML badge for a signal."""
+    surge = '&thinsp;<span style="color:#F59E0B;font-size:.65rem">⚡</span>' if vol_surge else ""
+    cls_map = {"BUY": "sig-buy", "STRONG BUY": "sig-strong", "SELL": "sig-sell"}
+    cls = cls_map.get(signal, "sig-hold")
+    return f'<span class="{cls}">{signal}{surge}</span>'
+
+
+def _trend_html(trend_ok: bool) -> str:
+    """Returns an HTML arrow for a trend indicator."""
+    if trend_ok:
+        return '<span style="color:var(--profit);font-weight:700">↑</span>'
+    return '<span style="color:var(--loss)">↓</span>'
+
+
 def forecast_48h(close: pd.Series) -> dict:
     """
     Schat de verwachte prijsbeweging in de komende 48 uur op basis van:
@@ -641,8 +743,9 @@ def _run_scan_inner() -> list:
                 sig["signal"]           = "HOLD"
                 sig["earnings_warning"] = True
 
-            sig["ticker"]     = ticker
-            sig["scanned_at"] = datetime.now().isoformat()
+            sig["ticker"]        = ticker
+            sig["scanned_at"]    = datetime.now().isoformat()
+            sig["recent_closes"] = [round(float(v), 4) for v in close.iloc[-10:].tolist()]
             results.append(sig)
         except Exception:
             continue
@@ -1033,7 +1136,7 @@ st.markdown("""
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Trading HQ">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#0f1117">
+<meta name="theme-color" content="#0B0E11">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="manifest" href="/app/static/manifest.json">
 <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%230f1117'/><text y='.9em' font-size='80'>📈</text></svg>">
@@ -1044,52 +1147,187 @@ start_watcher_once()
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.stApp { background:#0f1117; color:#e2e8f0; font-family:system-ui,sans-serif; }
-section[data-testid="stSidebar"] { background:#0c0f16 !important; border-right:1px solid #1e2436; }
-section[data-testid="stSidebar"] * { color:#cbd5e1 !important; }
-h1,h2,h3,h4 { color:#f1f5f9 !important; }
-.stButton>button { background:#007BFF !important; color:#fff !important; border:none !important;
-    border-radius:6px !important; font-weight:600 !important; }
-.stButton>button:hover { opacity:.85 !important; }
-.stTextInput input, .stNumberInput input {
-    background:#12161f !important; border:1px solid #1e2436 !important;
-    color:#e2e8f0 !important; border-radius:6px !important; }
-.stTabs [data-baseweb="tab"] { color:#64748b !important; }
-.stTabs [aria-selected="true"] { color:#007BFF !important; border-bottom-color:#007BFF !important; }
-div[data-testid="stMetricValue"] { color:#007BFF !important; font-weight:800 !important; }
-.pnl-pos { color:#4ade80; font-weight:700; }
-.pnl-neg { color:#f87171; font-weight:700; }
-.card { background:#12161f; border:1px solid #1e2436; border-radius:8px; padding:14px 18px; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
-/* Expander: donkere achtergrond + leesbare tekst */
-details { background:#12161f !important; border:1px solid #1e2436 !important; border-radius:8px !important; }
-details summary { background:#12161f !important; color:#f1f5f9 !important; font-weight:600 !important; }
-details summary:hover { background:#1e2436 !important; }
-details summary p { color:#f1f5f9 !important; }
-div[data-testid="stExpander"] { background:#12161f !important; border:1px solid #1e2436 !important; border-radius:8px !important; }
-div[data-testid="stExpander"] summary { color:#f1f5f9 !important; }
-div[data-testid="stExpander"] > div { background:#12161f !important; }
-.badge-buy  { background:#14532d; color:#4ade80; padding:3px 10px;
-    border-radius:999px; font-size:.75rem; font-weight:700; }
-.badge-sell { background:#450a0a; color:#f87171; padding:3px 10px;
-    border-radius:999px; font-size:.75rem; font-weight:700; }
-.badge-hold { background:#1e2d3d; color:#60a5fa; padding:3px 10px;
-    border-radius:999px; font-size:.75rem; font-weight:700; }
-.badge-strong { background:#052e16; color:#4ade80; padding:3px 10px;
-    border-radius:999px; font-size:.75rem; font-weight:700;
-    border:1px solid #4ade80; letter-spacing:.04em; }
-.risk-bar { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:2px; }
-.market-bull { color:#4ade80; font-weight:700; }
-.market-bear { color:#f87171; font-weight:700; }
-.market-neutral { color:#94a3b8; font-weight:700; }
-/* Form submit buttons — dark theme */
+/* ── Design tokens ── */
+:root {
+  --bg:        #0B0E11;
+  --surface:   #13171F;
+  --surface2:  #1A1F2E;
+  --border:    rgba(255,255,255,0.07);
+  --border2:   rgba(255,255,255,0.12);
+  --text:      #CDD6F4;
+  --text-muted:#64748B;
+  --text-dim:  #334155;
+  --profit:    #10B981;
+  --loss:      #EF4444;
+  --accent:    #3B82F6;
+  --gold:      #F59E0B;
+  --mono:      'JetBrains Mono', 'Consolas', monospace;
+  --sans:      'Inter', system-ui, sans-serif;
+}
+
+/* ── Base ── */
+.stApp { background:var(--bg) !important; color:var(--text); font-family:var(--sans); }
+* { box-sizing:border-box; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background:var(--bg); }
+::-webkit-scrollbar-thumb { background:var(--surface2); border-radius:4px; }
+
+/* ── Sidebar ── */
+section[data-testid="stSidebar"] {
+  background:#0D1017 !important;
+  border-right:1px solid var(--border) !important; }
+section[data-testid="stSidebar"] * { color:#94A3B8 !important; }
+section[data-testid="stSidebar"] [data-testid="stRadio"] label:hover { color:#CDD6F4 !important; }
+section[data-testid="stSidebar"] [aria-checked="true"] * { color:#CDD6F4 !important; font-weight:600 !important; }
+
+/* ── Headings ── */
+h1,h2,h3,h4 { color:#F1F5F9 !important; font-family:var(--sans) !important; letter-spacing:-.02em; }
+h2 { font-size:1.35rem !important; font-weight:700 !important; }
+h3 { font-size:1.05rem !important; font-weight:600 !important; }
+
+/* ── Metric cards ── */
+div[data-testid="stMetricValue"] {
+  font-family:var(--mono) !important;
+  color:#F1F5F9 !important;
+  font-weight:600 !important;
+  font-size:1.25rem !important;
+  letter-spacing:-.02em; }
+div[data-testid="stMetricDelta"] { font-family:var(--mono) !important; font-size:.78rem !important; }
+div[data-testid="metric-container"] {
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:12px 16px !important; }
+
+/* ── Buttons ── */
+.stButton>button {
+  background:var(--accent) !important; color:#fff !important;
+  border:none !important; border-radius:6px !important;
+  font-weight:600 !important; font-size:.85rem !important;
+  letter-spacing:.01em; transition:opacity .15s; }
+.stButton>button:hover { opacity:.82 !important; }
 [data-testid="stFormSubmitButton"] button {
-    background:#1e2d3d !important; color:#e2e8f0 !important;
-    border:1px solid #334155 !important; border-radius:6px !important;
-    font-weight:600 !important; }
+  background:var(--surface2) !important; color:var(--text) !important;
+  border:1px solid var(--border2) !important; border-radius:6px !important;
+  font-weight:600 !important; }
 [data-testid="stFormSubmitButton"] button:hover {
-    background:#263548 !important; border-color:#60a5fa !important;
-    color:#f1f5f9 !important; }
+  background:#222840 !important; border-color:var(--accent) !important; }
+
+/* ── Inputs ── */
+.stTextInput input, .stNumberInput input, .stSelectbox select {
+  background:var(--surface) !important; border:1px solid var(--border2) !important;
+  color:var(--text) !important; border-radius:6px !important;
+  font-family:var(--mono) !important; font-size:.9rem !important; }
+.stTextInput input:focus, .stNumberInput input:focus {
+  border-color:var(--accent) !important; box-shadow:0 0 0 2px rgba(59,130,246,.2) !important; }
+
+/* ── Expanders / Cards ── */
+details, div[data-testid="stExpander"] {
+  background:var(--surface) !important;
+  border:1px solid var(--border) !important;
+  border-radius:10px !important; }
+details summary, div[data-testid="stExpander"] summary {
+  background:var(--surface) !important;
+  color:#F1F5F9 !important; font-weight:600 !important;
+  font-size:.9rem !important; }
+details summary:hover, div[data-testid="stExpander"] summary:hover {
+  background:var(--surface2) !important; }
+details summary p, div[data-testid="stExpander"] summary p { color:#F1F5F9 !important; }
+div[data-testid="stExpander"] > div { background:var(--surface) !important; }
+
+/* ── Card component ── */
+.card {
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:14px 16px; }
+.card-glass {
+  background:rgba(19,23,31,0.85);
+  border:1px solid var(--border2);
+  border-radius:10px;
+  padding:14px 16px; }
+
+/* ── P&L / number classes ── */
+.pnl-pos { color:var(--profit); font-weight:700; font-family:var(--mono); }
+.pnl-neg { color:var(--loss);   font-weight:700; font-family:var(--mono); }
+.mono    { font-family:var(--mono) !important; }
+
+/* ── Badges ── */
+.badge-buy   { background:rgba(16,185,129,.15); color:#10B981;
+  padding:2px 9px; border-radius:4px; font-size:.72rem; font-weight:700;
+  border:1px solid rgba(16,185,129,.3); letter-spacing:.03em; }
+.badge-sell  { background:rgba(239,68,68,.15); color:#EF4444;
+  padding:2px 9px; border-radius:4px; font-size:.72rem; font-weight:700;
+  border:1px solid rgba(239,68,68,.3); }
+.badge-hold  { background:rgba(59,130,246,.12); color:#60A5FA;
+  padding:2px 9px; border-radius:4px; font-size:.72rem; font-weight:700;
+  border:1px solid rgba(59,130,246,.2); }
+.badge-strong { background:rgba(245,158,11,.15); color:#F59E0B;
+  padding:2px 9px; border-radius:4px; font-size:.72rem; font-weight:700;
+  border:1px solid rgba(245,158,11,.35); letter-spacing:.04em; }
+
+/* ── Risk bars ── */
+.risk-bar { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:2px; }
+
+/* ── Market status ── */
+.market-bull    { color:var(--profit); font-weight:700; }
+.market-bear    { color:var(--loss);   font-weight:700; }
+.market-neutral { color:#94A3B8;       font-weight:700; }
+
+/* ── Pulsating status dot ── */
+@keyframes pulse-dot {
+  0%   { box-shadow:0 0 0 0 currentColor; opacity:1; }
+  70%  { box-shadow:0 0 0 6px transparent; opacity:.7; }
+  100% { box-shadow:0 0 0 0 transparent; opacity:1; }
+}
+.status-live { display:inline-block; width:8px; height:8px; border-radius:50%;
+  animation:pulse-dot 2s ease infinite; vertical-align:middle; margin-right:6px; }
+.status-open    { background:var(--profit);  color:var(--profit); }
+.status-pre     { background:var(--gold);    color:var(--gold); }
+.status-closed  { background:var(--loss);    color:var(--loss); }
+
+/* ── Status banner ── */
+.status-bar {
+  background:var(--surface); border:1px solid var(--border2);
+  border-radius:8px; padding:9px 14px; margin-bottom:14px;
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+
+/* ── Scan table ── */
+.scan-table { width:100%; border-collapse:collapse; font-size:.82rem; }
+.scan-table th {
+  color:var(--text-muted); font-weight:500; font-size:.72rem;
+  text-transform:uppercase; letter-spacing:.06em;
+  padding:6px 10px; border-bottom:1px solid var(--border2);
+  text-align:left; white-space:nowrap; }
+.scan-table td { padding:5px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+.scan-table tr:nth-child(even) td { background:rgba(255,255,255,.02); }
+.scan-table tr:hover td { background:var(--surface2); }
+.scan-table .mono-cell { font-family:var(--mono); font-size:.8rem; }
+.sig-buy    { color:var(--profit); font-weight:700; font-size:.72rem; }
+.sig-sell   { color:var(--loss);   font-weight:700; font-size:.72rem; }
+.sig-strong { color:var(--gold);   font-weight:700; font-size:.72rem; }
+.sig-hold   { color:var(--text-muted); font-size:.72rem; }
+
+/* ── Signal history priority rows ── */
+.sh-row-strong { background:rgba(245,158,11,.07) !important; }
+.sh-row-buy    { background:rgba(16,185,129,.05) !important; }
+.sh-row-sell   { background:rgba(239,68,68,.07) !important; }
+
+/* ── Divider ── */
+hr { border-color:var(--border) !important; margin:10px 0 !important; }
+
+/* ── Dataframe ── */
+div[data-testid="stDataFrame"] { border-radius:8px; overflow:hidden; border:1px solid var(--border); }
+div[data-testid="stDataFrame"] table { font-family:var(--mono); font-size:.8rem; }
+
+/* ── Spinner / info ── */
+div[data-testid="stAlert"] {
+  background:var(--surface) !important; border:1px solid var(--border2) !important;
+  border-radius:8px !important; color:var(--text) !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1333,6 +1571,7 @@ if page == "Portfolio & P&L":
     st.divider()
 
     # ── Per-positie detail ────────────────────────────────────────────────────
+    _all_last_signals = load_last_signals()
     for ticker in tickers:
         pos           = portfolio[ticker]
         current_price = prices.get(ticker)
@@ -1411,7 +1650,7 @@ if page == "Portfolio & P&L":
                 if _display_price:
                     huidige_waarde = _display_price * pos["shares"]
                     # Prefer stored scan result (uses 1y data) over recomputing from 1mo hist
-                    _stored_sig = load_last_signals().get(ticker, {})
+                    _stored_sig = _all_last_signals.get(ticker, {})
                     if _stored_sig and _stored_sig.get("signal") not in (None, "DATA_ERROR", "?"):
                         sig_data = _stored_sig
                     elif not hist.empty:
@@ -1460,20 +1699,7 @@ if page == "Portfolio & P&L":
                     _beta      = (_pt_card or {}).get("beta")
                     _upside    = (_pt_card or {}).get("target_1y_pct")
                     # Risk score: beta → number of filled bars (1–5)
-                    if _beta is not None:
-                        _bars     = min(5, max(1, round(abs(_beta) * 2)))
-                        _bar_html = "".join(
-                            f'<span class="risk-bar" style="background:{"#f87171" if i < _bars else "#1e2436"}"></span>'
-                            for i in range(5)
-                        )
-                        _beta_lbl = "Laag" if abs(_beta) < 0.8 else ("Hoog" if abs(_beta) > 1.5 else "Gemiddeld")
-                        _risk_row = (
-                            f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Risico (Beta {_beta:.1f})</div>'
-                            f'<div style="margin-top:2px">{_bar_html} '
-                            f'<span style="font-size:.7rem;color:#94a3b8">{_beta_lbl}</span></div>'
-                        )
-                    else:
-                        _risk_row = ""
+                    _risk_row = _render_risk_bar(_beta)
                     # Analyst upside
                     if _upside is not None:
                         _up_color  = "#4ade80" if _upside >= 0 else "#f87171"
@@ -1511,7 +1737,7 @@ if page == "Portfolio & P&L":
                     """, unsafe_allow_html=True)
 
                     # Telegram sync badge
-                    _ls   = load_last_signals().get(ticker, {})
+                    _ls   = _all_last_signals.get(ticker, {})
                     _tg   = _ls.get("last_telegram")
                     _sent = (_ls.get("sent_at") or "")[:16].replace("T", " ")
                     if _tg:
@@ -1536,18 +1762,6 @@ if page == "Portfolio & P&L":
                     # Koersdoelen sectie
                     pt = _pt_card  # already fetched above
                     if pt:
-                        def _tgt_row(label, price_usd, pct, color):
-                            if price_usd is None:
-                                return f'<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>'
-                            arrow = "▲" if (pct or 0) >= 0 else "▼"
-                            return (
-                                f'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #1e2436">'
-                                f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
-                                f'<span style="font-size:.78rem;color:{color};font-weight:600">'
-                                f'{_fmt(price_usd)} <span style="font-size:.68rem">{arrow}{abs(pct or 0):.1f}%</span></span>'
-                                f'</div>'
-                            )
-
                         t1m  = pt.get("target_1m");  p1m  = pt.get("target_1m_pct", 0)
                         t3m  = pt.get("target_3m");  p3m  = pt.get("target_3m_pct", 0)
                         t1y  = pt.get("target_1y");  p1y  = pt.get("target_1y_pct", 0)
@@ -1648,18 +1862,7 @@ elif page == "Koopkans":
     )
 
     ms_kk = market_status()
-    dag_map_kk = ["ma","di","wo","do","vr","za","zo"]
-    now_str_kk = ms_kk["now_nl"].strftime("%H:%M")
-    st.markdown(
-        f'<div style="background:#12161f;border:1.5px solid {ms_kk["color"]}33;'
-        f'border-radius:8px;padding:10px 16px;margin-bottom:16px;display:flex;'
-        f'align-items:center;gap:16px;flex-wrap:wrap">'
-        f'<span style="color:{ms_kk["color"]};font-weight:700;font-size:.9rem">⬤ {ms_kk["status"].upper()}</span>'
-        f'<span style="color:#e2e8f0;font-size:.85rem">{ms_kk["msg"]}</span>'
-        f'<span style="color:#475569;font-size:.75rem">NL-tijd: {now_str_kk}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    _render_status_banner(ms_kk)
 
     with st.spinner("Koopsignalen ophalen..."):
         kk_scan = fetch_scan()
@@ -1730,23 +1933,6 @@ elif page == "Koopkans":
                 _rec  = (_pt_kk or {}).get("recommendation", "—")
                 _na   = (_pt_kk or {}).get("n_analysts", 0)
 
-                def _pct_row(label, pct, target):
-                    if target is None:
-                        return (f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
-                                f'border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">'
-                                f'{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>')
-                    color = "#4ade80" if (pct or 0) >= 0 else "#f87171"
-                    arrow = "▲" if (pct or 0) >= 0 else "▼"
-                    return (
-                        f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                        f'padding:5px 0;border-bottom:1px solid #1e2436">'
-                        f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
-                        f'<span style="font-size:.82rem;color:{color};font-weight:700">'
-                        f'{arrow} {abs(pct or 0):.1f}%'
-                        f'<span style="font-size:.68rem;color:#94a3b8"> (${target:.2f})</span></span>'
-                        f'</div>'
-                    )
-
                 # 48u rij voor de card
                 if _fc:
                     _fc_pct  = _fc["verwachting_pct"]
@@ -1755,19 +1941,7 @@ elif page == "Koopkans":
                 else:
                     _fc_row = _pct_row("48u (technisch)", None, None)
 
-                _risk_html = ""
-                if _beta_kk is not None:
-                    _bars_kk = min(5, max(1, round(abs(_beta_kk) * 2)))
-                    _bar_html_kk = "".join(
-                        f'<span class="risk-bar" style="background:{"#f87171" if i < _bars_kk else "#1e2436"}"></span>'
-                        for i in range(5)
-                    )
-                    _blbl = "Laag" if abs(_beta_kk) < 0.8 else ("Hoog" if abs(_beta_kk) > 1.5 else "Gemiddeld")
-                    _risk_html = (
-                        f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Risico (Beta {_beta_kk:.1f})</div>'
-                        f'<div style="margin-top:2px">{_bar_html_kk} '
-                        f'<span style="font-size:.7rem;color:#94a3b8">{_blbl}</span></div>'
-                    )
+                _risk_html = _render_risk_bar(_beta_kk)
 
                 trend_ok_kk = (sma200 is None) or (price > sma200)
                 trend_html  = (
@@ -1880,57 +2054,124 @@ elif page == "Koopkans":
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif page == "Markt Scan":
-    st.markdown("## 🔍 Markt Scan — Top 50 Volatile")
-    st.caption("Gesorteerd op RSI · laagste RSI = meest oversold = potentieel koopsignaal")
+    st.markdown("## Markt Scan")
 
-    with st.spinner("Data ophalen (kan 30 seconden duren)..."):
+    _ms_scan = market_status()
+    _render_status_banner(_ms_scan)
+
+    _compact = st.toggle("Compacte weergave", value=True, key="scan_compact")
+
+    with st.spinner("Data ophalen..."):
         scan_results = fetch_scan()
 
     if not scan_results:
-        st.warning("Geen scanresultaten. Probeer opnieuw via 'Nu Scannen' in de sidebar.")
+        st.warning("Geen scanresultaten beschikbaar.")
     else:
-        emoji_map = {"BUY": "🟢", "STRONG BUY": "💎", "SELL": "🔴", "HOLD": "🔵"}
+        _n_strong = sum(1 for s in scan_results if s.get("signal") == "STRONG BUY")
+        _n_buy    = sum(1 for s in scan_results if s.get("signal") == "BUY")
+        _n_sell   = sum(1 for s in scan_results if s.get("signal") == "SELL")
+        st.markdown(
+            f'<div style="font-size:.78rem;color:var(--text-muted);margin-bottom:10px">'
+            f'<span style="color:var(--gold);font-weight:700">{_n_strong} STRONG BUY</span>'
+            f'&ensp;·&ensp;<span style="color:var(--profit);font-weight:700">{_n_buy} BUY</span>'
+            f'&ensp;·&ensp;<span style="color:var(--loss);font-weight:700">{_n_sell} SELL</span>'
+            f'&ensp;·&ensp;{len(scan_results)} tickers gescand</div>',
+            unsafe_allow_html=True,
+        )
 
-        # Haal analyst-data op voor BUY/STRONG BUY tickers (gecached, max ~10 calls)
-        _buy_tickers = [s["ticker"] for s in scan_results
-                        if s.get("signal") in ("BUY", "STRONG BUY") and s.get("ticker")]
-        _pt_cache: dict = {}
-        for _bt in _buy_tickers[:10]:
-            _pt_cache[_bt] = fetch_price_targets(_bt)
+        if _compact:
+            # ── Compacte HTML tabel met sparklines ───────────────────────
+            rows_html = ""
+            for s in scan_results:
+                sig       = s.get("signal", "HOLD")
+                price     = s.get("price")
+                rsi       = s.get("rsi")
+                sma200    = s.get("sma200")
+                ubb       = s.get("upper_bb")
+                lbb       = s.get("lower_bb")
+                closes    = s.get("recent_closes", [])
+                in_port   = s.get("ticker") in portfolio
+                trend_ok  = (sma200 is None) or (price and price > sma200)
+                vol_surge = s.get("vol_surge", False)
+                spark     = _spark_svg(closes)
+                port_dot  = '<span style="color:var(--accent);font-size:.65rem">&thinsp;●</span>' if in_port else ""
 
-        rows = []
-        for s in scan_results:
-            signal   = s.get("signal", "?")
-            sma200   = s.get("sma200")
-            price    = s.get("price")
-            trend_ok = (sma200 is None) or (price and price > sma200)
-            vol_tag  = " ⚡" if s.get("vol_surge") else ""
-            _pt      = _pt_cache.get(s.get("ticker"), {})
-            _rec     = (_pt.get("recommendation") or "—") if _pt else "—"
-            _upside  = _pt.get("target_1y_pct") if _pt else None
-            _upside_str = (f"{'▲' if _upside >= 0 else '▼'}{abs(_upside):.0f}%"
-                           if _upside is not None else "—")
-            rows.append({
-                " ":            emoji_map.get(signal, "⚪"),
-                "Ticker":       s.get("ticker", "?"),
-                "Prijs":        f"${price:.2f}"          if price             else "—",
-                "RSI":          f"{s['rsi']:.1f}"        if s.get("rsi")      else "—",
-                "SMA-200":      f"${sma200:.2f}"         if sma200            else "—",
-                "Trend":        "↑" if trend_ok else "↓",
-                "BB Hoog":      f"${s['upper_bb']:.2f}"  if s.get("upper_bb") else "—",
-                "BB Laag":      f"${s['lower_bb']:.2f}"  if s.get("lower_bb") else "—",
-                "Signaal":      signal + vol_tag,
-                "Aanbeveling":  _rec,
-                "Upside 1j":    _upside_str,
-                "Portfolio":    "✓" if s.get("ticker") in portfolio else "",
-            })
+                rows_html += (
+                    f'<tr>'
+                    f'<td class="mono-cell" style="font-weight:700;color:#F1F5F9">{s["ticker"]}{port_dot}</td>'
+                    f'<td class="mono-cell">${price:.2f}</td>'
+                    f'<td>{_sig_html(sig, vol_surge)}</td>'
+                    f'<td class="mono-cell" style="color:#F59E0B">{rsi:.1f}</td>'
+                    f'<td>{_trend_html(trend_ok)}</td>'
+                    f'<td class="mono-cell" style="color:#60A5FA;font-size:.75rem">'
+                    f'{"${:.2f}".format(lbb) if lbb else "—"}</td>'
+                    f'<td>{spark}</td>'
+                    f'</tr>'
+                ) if price else ""
 
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        _n_strong = sum(1 for r in rows if "STRONG BUY" in r["Signaal"])
-        _n_buy    = sum(1 for r in rows if r["Signaal"].startswith("BUY"))
-        st.caption(f"Gescand: {len(scan_results)} tickers  ·  "
-                   f"{_n_strong} STRONG BUY  ·  {_n_buy} KOOP  ·  "
-                   f"{sum(1 for r in rows if r['Signaal']=='SELL')} VERKOOP")
+            st.markdown(
+                f'<div style="overflow-x:auto"><table class="scan-table">'
+                f'<thead><tr>'
+                f'<th>Ticker</th><th>Prijs</th><th>Signaal</th>'
+                f'<th>RSI</th><th>Trend</th><th>BB Laag</th><th>10d trend</th>'
+                f'</tr></thead>'
+                f'<tbody>{rows_html}</tbody>'
+                f'</table></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            # ── Uitgebreide weergave ──────────────────────────────────────
+            _pt_cache: dict = {}
+            for _bt in [s["ticker"] for s in scan_results if s.get("signal") in ("BUY","STRONG BUY")][:10]:
+                _pt_cache[_bt] = fetch_price_targets(_bt)
+
+            rows_html = ""
+            for s in scan_results:
+                sig      = s.get("signal", "HOLD")
+                price    = s.get("price")
+                rsi      = s.get("rsi")
+                sma200   = s.get("sma200")
+                ubb      = s.get("upper_bb")
+                lbb      = s.get("lower_bb")
+                closes   = s.get("recent_closes", [])
+                in_port  = s.get("ticker") in portfolio
+                trend_ok = (sma200 is None) or (price and price > sma200)
+                vol_surge = s.get("vol_surge", False)
+                spark    = _spark_svg(closes)
+                _pt      = _pt_cache.get(s["ticker"], {})
+                _upside  = _pt.get("target_1y_pct") if _pt else None
+                _up_str  = (f'<span style="color:{"var(--profit)" if _upside >= 0 else "var(--loss)"}">'
+                            f'{"▲" if _upside >= 0 else "▼"}{abs(_upside):.0f}%</span>'
+                            if _upside is not None else "—")
+                port_dot = '<span style="color:var(--accent);font-size:.65rem">&thinsp;●</span>' if in_port else ""
+
+                rows_html += (
+                    f'<tr>'
+                    f'<td class="mono-cell" style="font-weight:700;color:#F1F5F9">{s["ticker"]}{port_dot}</td>'
+                    f'<td class="mono-cell">${price:.2f}</td>'
+                    f'<td>{_sig_html(sig, vol_surge)}</td>'
+                    f'<td class="mono-cell" style="color:#F59E0B">{rsi:.1f}</td>'
+                    f'<td>{_trend_html(trend_ok)}</td>'
+                    f'<td class="mono-cell" style="color:#60A5FA;font-size:.75rem">'
+                    f'{"${:.2f}".format(lbb) if lbb else "—"}</td>'
+                    f'<td class="mono-cell" style="font-size:.75rem">'
+                    f'{"${:.2f}".format(sma200) if sma200 else "—"}</td>'
+                    f'<td style="font-size:.78rem">{_up_str}</td>'
+                    f'<td>{spark}</td>'
+                    f'</tr>'
+                ) if price else ""
+
+            st.markdown(
+                f'<div style="overflow-x:auto"><table class="scan-table">'
+                f'<thead><tr>'
+                f'<th>Ticker</th><th>Prijs</th><th>Signaal</th>'
+                f'<th>RSI</th><th>Trend</th><th>BB Laag</th>'
+                f'<th>SMA-200</th><th>Upside 1j</th><th>10d trend</th>'
+                f'</tr></thead>'
+                f'<tbody>{rows_html}</tbody>'
+                f'</table></div>',
+                unsafe_allow_html=True,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1946,18 +2187,7 @@ elif page == "Investeer Advies":
 
     # ── Marktstatus banner ────────────────────────────────────────────────────
     ms = market_status()
-    dag_map = ["ma","di","wo","do","vr","za","zo"]
-    now_str = ms["now_nl"].strftime("%H:%M")
-    st.markdown(
-        f'<div style="background:#12161f;border:1.5px solid {ms["color"]}33;'
-        f'border-radius:8px;padding:10px 16px;margin-bottom:12px;'
-        f'display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
-        f'<span style="color:{ms["color"]};font-weight:700;font-size:.9rem">⬤ {ms["status"].upper()}</span>'
-        f'<span style="color:#e2e8f0;font-size:.85rem">{ms["msg"]}</span>'
-        f'<span style="color:#475569;font-size:.75rem">NL-tijd: {now_str}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    _render_status_banner(ms)
 
     # ── EUR/USD koers ─────────────────────────────────────────────────────────
     eur_usd = fetch_eur_usd()
@@ -1977,8 +2207,12 @@ elif page == "Investeer Advies":
 
     budget_usd = budget_eur * eur_usd_input
     st.markdown(
-        f"**Budget:** €{budget_eur:,.2f} → "
-        f"<span style='color:#007BFF;font-weight:700'>${budget_usd:,.2f}</span>",
+        f'<div style="font-family:var(--mono);font-size:.9rem;margin:6px 0 10px">'
+        f'<span style="color:var(--text-muted)">Budget: </span>'
+        f'<span style="color:#F1F5F9;font-weight:600">€{budget_eur:,.2f}</span>'
+        f'<span style="color:var(--text-muted)"> → </span>'
+        f'<span style="color:var(--accent);font-weight:700">${budget_usd:,.2f}</span>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
@@ -2214,27 +2448,78 @@ elif page == "Investeer Advies":
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif page == "Signaalgeschiedenis":
-    st.markdown("## 📋 Signaalgeschiedenis")
+    st.markdown("## Signaalgeschiedenis")
 
     signals = load_signals()
     if not signals:
-        st.info("Nog geen signalen gelogd. Wacht op de volgende scan of klik 'Nu Scannen'.")
+        st.info("Nog geen signalen gelogd.")
     else:
-        label_map = {"BUY": "🟢 KOPEN", "SELL": "🔴 VERKOPEN", "HOLD": "🔵 HOLD"}
-        rows = []
-        for s in signals[:150]:
-            ts = s.get("scanned_at", "")[:16].replace("T", " ")
-            signal = s.get("signal", "?")
-            rows.append({
-                "Tijdstip": ts,
-                "Ticker":   s.get("ticker", "?"),
-                "Signaal":  label_map.get(signal, signal),
-                "Prijs":    f"${s['price']:.2f}" if s.get("price") else "—",
-                "RSI":      f"{s['rsi']:.1f}"    if s.get("rsi")   else "—",
-            })
+        # Filter controls
+        sh_col1, sh_col2 = st.columns([2, 1])
+        with sh_col1:
+            _sh_filter = st.selectbox(
+                "Filter", ["Alles", "STRONG BUY", "BUY", "SELL", "HOLD"],
+                label_visibility="collapsed", key="sh_filter",
+            )
+        with sh_col2:
+            _sh_port_only = st.toggle("Alleen portfolio", key="sh_port")
 
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption(f"{len(signals)} signalen opgeslagen")
+        _port_tickers = set(k for k in load_portfolio().keys() if not k.startswith("_"))
+
+        def _sh_row_cls(sig: str) -> str:
+            return {"STRONG BUY": "sh-row-strong", "BUY": "sh-row-buy", "SELL": "sh-row-sell"}.get(sig, "")
+
+        def _sh_sig_badge(sig: str) -> str:
+            styles = {
+                "STRONG BUY": f'background:rgba(245,158,11,.2);color:#F59E0B;border:1px solid rgba(245,158,11,.4)',
+                "BUY":        f'background:rgba(16,185,129,.15);color:#10B981;border:1px solid rgba(16,185,129,.3)',
+                "SELL":       f'background:rgba(239,68,68,.15);color:#EF4444;border:1px solid rgba(239,68,68,.3)',
+                "HOLD":       f'background:rgba(100,116,139,.1);color:#64748B;border:1px solid rgba(100,116,139,.2)',
+            }
+            style = styles.get(sig, styles["HOLD"])
+            return (f'<span style="{style};padding:2px 8px;border-radius:4px;'
+                    f'font-size:.7rem;font-weight:700;font-family:var(--mono)">{sig}</span>')
+
+        filtered = signals[:200]
+        if _sh_filter != "Alles":
+            filtered = [s for s in filtered if s.get("signal") == _sh_filter]
+        if _sh_port_only:
+            filtered = [s for s in filtered if s.get("ticker") in _port_tickers]
+
+        rows_html = ""
+        for s in filtered:
+            sig    = s.get("signal", "?")
+            ts     = s.get("scanned_at", "")[:16].replace("T", " ")
+            ticker = s.get("ticker", "?")
+            price  = s.get("price")
+            rsi    = s.get("rsi")
+            in_p   = ticker in _port_tickers
+            row_cls = _sh_row_cls(sig)
+            port_dot = '<span style="color:var(--accent);font-size:.6rem">&thinsp;●</span>' if in_p else ""
+            rows_html += (
+                f'<tr class="{row_cls}">'
+                f'<td style="color:var(--text-muted);font-size:.75rem;font-family:var(--mono)">{ts}</td>'
+                f'<td style="font-weight:700;color:#F1F5F9;font-family:var(--mono)">{ticker}{port_dot}</td>'
+                f'<td>{_sh_sig_badge(sig)}</td>'
+                f'<td class="mono-cell">{f"${price:.2f}" if price else "—"}</td>'
+                f'<td class="mono-cell" style="color:#F59E0B">{f"{rsi:.1f}" if rsi else "—"}</td>'
+                f'</tr>'
+            )
+
+        st.markdown(
+            f'<div style="overflow-x:auto"><table class="scan-table">'
+            f'<thead><tr>'
+            f'<th>Tijdstip</th><th>Ticker</th><th>Signaal</th><th>Prijs</th><th>RSI</th>'
+            f'</tr></thead>'
+            f'<tbody>{rows_html}</tbody>'
+            f'</table></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div style="font-size:.72rem;color:var(--text-muted);margin-top:8px">'
+            f'{len(filtered)} van {len(signals)} signalen</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
