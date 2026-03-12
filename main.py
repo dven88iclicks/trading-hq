@@ -1328,6 +1328,28 @@ div[data-testid="stDataFrame"] table { font-family:var(--mono); font-size:.8rem;
 div[data-testid="stAlert"] {
   background:var(--surface) !important; border:1px solid var(--border2) !important;
   border-radius:8px !important; color:var(--text) !important; }
+
+/* ── Mobile responsive ── */
+@media (max-width: 640px) {
+  /* Stack all columns vertically */
+  div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+  div[data-testid="column"] {
+    width: 100% !important;
+    flex: 1 1 100% !important;
+    min-width: 100% !important; }
+  /* Tighter padding on mobile */
+  .card { padding: 10px 12px !important; }
+  .scan-table th, .scan-table td { padding: 4px 6px !important; }
+  /* Full-width forms */
+  .stForm { width: 100% !important; }
+  /* Bigger tap targets for buttons */
+  .stButton > button,
+  [data-testid="stFormSubmitButton"] button {
+    min-height: 44px !important;
+    width: 100% !important; }
+  /* Toggle right-aligned in header → below title on mobile */
+  [data-testid="stToggle"] { margin-top: 4px; }
+}
 </style>
 """, unsafe_allow_html=True)
 
