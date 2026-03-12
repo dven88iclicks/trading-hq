@@ -2218,8 +2218,12 @@ elif page == "Investeer Advies":
 
     budget_usd = budget_eur * eur_usd_input
     st.markdown(
-        f"**Budget:** €{budget_eur:,.2f} → "
-        f"<span style='color:#007BFF;font-weight:700'>${budget_usd:,.2f}</span>",
+        f'<div style="font-family:var(--mono);font-size:.9rem;margin:6px 0 10px">'
+        f'<span style="color:var(--text-muted)">Budget: </span>'
+        f'<span style="color:#F1F5F9;font-weight:600">€{budget_eur:,.2f}</span>'
+        f'<span style="color:var(--text-muted)"> → </span>'
+        f'<span style="color:var(--accent);font-weight:700">${budget_usd:,.2f}</span>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
