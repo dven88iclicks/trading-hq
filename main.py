@@ -425,6 +425,87 @@ def _spark_svg(closes: list, width: int = 56, height: int = 18) -> str:
     )
 
 
+def _render_status_banner(ms: dict) -> None:
+    """Renders a pulsating market status banner."""
+    cls = "status-open" if ms["is_open"] else ("status-pre" if ms["status"] == "pre-market" else "status-closed")
+    st.markdown(
+        f'<div class="status-bar">'
+        f'<span class="status-live {cls}"></span>'
+        f'<span style="color:#F1F5F9;font-weight:600;font-size:.88rem">{ms["status"].upper()}</span>'
+        f'<span style="color:var(--text-muted);font-size:.82rem">{ms["msg"]}</span>'
+        f'<span style="color:var(--text-dim);font-size:.75rem">NL {ms["now_nl"].strftime("%H:%M")}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_risk_bar(beta) -> str:
+    """Returns HTML for a 5-bar risk indicator based on beta."""
+    if beta is None:
+        return ""
+    bars = min(5, max(1, round(abs(beta) * 2)))
+    bar_html = "".join(
+        f'<span class="risk-bar" style="background:{"#f87171" if i < bars else "#1e2436"}"></span>'
+        for i in range(5)
+    )
+    lbl = "Laag" if abs(beta) < 0.8 else ("Hoog" if abs(beta) > 1.5 else "Gemiddeld")
+    return (
+        f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Risico (Beta {beta:.1f})</div>'
+        f'<div style="margin-top:2px">{bar_html} '
+        f'<span style="font-size:.7rem;color:#94a3b8">{lbl}</span></div>'
+    )
+
+
+def _pct_row(label: str, pct, target) -> str:
+    """Returns an HTML row showing a percentage target."""
+    if target is None:
+        return (f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
+                f'border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">'
+                f'{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>')
+    color = "#4ade80" if (pct or 0) >= 0 else "#f87171"
+    arrow = "▲" if (pct or 0) >= 0 else "▼"
+    return (
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'padding:5px 0;border-bottom:1px solid #1e2436">'
+        f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
+        f'<span style="font-size:.82rem;color:{color};font-weight:700">'
+        f'{arrow} {abs(pct or 0):.1f}%'
+        f'<span style="font-size:.68rem;color:#94a3b8"> (${target:.2f})</span></span>'
+        f'</div>'
+    )
+
+
+def _tgt_row(label: str, price_usd, pct, color: str) -> str:
+    """Returns an HTML row showing an analyst price target."""
+    if price_usd is None:
+        return (f'<div style="display:flex;justify-content:space-between;padding:4px 0;'
+                f'border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">'
+                f'{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>')
+    arrow = "▲" if (pct or 0) >= 0 else "▼"
+    return (
+        f'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #1e2436">'
+        f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
+        f'<span style="font-size:.78rem;color:{color};font-weight:600">'
+        f'{_fmt(price_usd)} <span style="font-size:.68rem">{arrow}{abs(pct or 0):.1f}%</span></span>'
+        f'</div>'
+    )
+
+
+def _sig_html(signal: str, vol_surge: bool) -> str:
+    """Returns an HTML badge for a signal."""
+    surge = '&thinsp;<span style="color:#F59E0B;font-size:.65rem">⚡</span>' if vol_surge else ""
+    cls_map = {"BUY": "sig-buy", "STRONG BUY": "sig-strong", "SELL": "sig-sell"}
+    cls = cls_map.get(signal, "sig-hold")
+    return f'<span class="{cls}">{signal}{surge}</span>'
+
+
+def _trend_html(trend_ok: bool) -> str:
+    """Returns an HTML arrow for a trend indicator."""
+    if trend_ok:
+        return '<span style="color:var(--profit);font-weight:700">↑</span>'
+    return '<span style="color:var(--loss)">↓</span>'
+
+
 def forecast_48h(close: pd.Series) -> dict:
     """
     Schat de verwachte prijsbeweging in de komende 48 uur op basis van:
@@ -1490,6 +1571,7 @@ if page == "Portfolio & P&L":
     st.divider()
 
     # ── Per-positie detail ────────────────────────────────────────────────────
+    _all_last_signals = load_last_signals()
     for ticker in tickers:
         pos           = portfolio[ticker]
         current_price = prices.get(ticker)
@@ -1568,7 +1650,7 @@ if page == "Portfolio & P&L":
                 if _display_price:
                     huidige_waarde = _display_price * pos["shares"]
                     # Prefer stored scan result (uses 1y data) over recomputing from 1mo hist
-                    _stored_sig = load_last_signals().get(ticker, {})
+                    _stored_sig = _all_last_signals.get(ticker, {})
                     if _stored_sig and _stored_sig.get("signal") not in (None, "DATA_ERROR", "?"):
                         sig_data = _stored_sig
                     elif not hist.empty:
@@ -1617,20 +1699,7 @@ if page == "Portfolio & P&L":
                     _beta      = (_pt_card or {}).get("beta")
                     _upside    = (_pt_card or {}).get("target_1y_pct")
                     # Risk score: beta → number of filled bars (1–5)
-                    if _beta is not None:
-                        _bars     = min(5, max(1, round(abs(_beta) * 2)))
-                        _bar_html = "".join(
-                            f'<span class="risk-bar" style="background:{"#f87171" if i < _bars else "#1e2436"}"></span>'
-                            for i in range(5)
-                        )
-                        _beta_lbl = "Laag" if abs(_beta) < 0.8 else ("Hoog" if abs(_beta) > 1.5 else "Gemiddeld")
-                        _risk_row = (
-                            f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Risico (Beta {_beta:.1f})</div>'
-                            f'<div style="margin-top:2px">{_bar_html} '
-                            f'<span style="font-size:.7rem;color:#94a3b8">{_beta_lbl}</span></div>'
-                        )
-                    else:
-                        _risk_row = ""
+                    _risk_row = _render_risk_bar(_beta)
                     # Analyst upside
                     if _upside is not None:
                         _up_color  = "#4ade80" if _upside >= 0 else "#f87171"
@@ -1668,7 +1737,7 @@ if page == "Portfolio & P&L":
                     """, unsafe_allow_html=True)
 
                     # Telegram sync badge
-                    _ls   = load_last_signals().get(ticker, {})
+                    _ls   = _all_last_signals.get(ticker, {})
                     _tg   = _ls.get("last_telegram")
                     _sent = (_ls.get("sent_at") or "")[:16].replace("T", " ")
                     if _tg:
@@ -1693,18 +1762,6 @@ if page == "Portfolio & P&L":
                     # Koersdoelen sectie
                     pt = _pt_card  # already fetched above
                     if pt:
-                        def _tgt_row(label, price_usd, pct, color):
-                            if price_usd is None:
-                                return f'<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>'
-                            arrow = "▲" if (pct or 0) >= 0 else "▼"
-                            return (
-                                f'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #1e2436">'
-                                f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
-                                f'<span style="font-size:.78rem;color:{color};font-weight:600">'
-                                f'{_fmt(price_usd)} <span style="font-size:.68rem">{arrow}{abs(pct or 0):.1f}%</span></span>'
-                                f'</div>'
-                            )
-
                         t1m  = pt.get("target_1m");  p1m  = pt.get("target_1m_pct", 0)
                         t3m  = pt.get("target_3m");  p3m  = pt.get("target_3m_pct", 0)
                         t1y  = pt.get("target_1y");  p1y  = pt.get("target_1y_pct", 0)
@@ -1804,17 +1861,8 @@ elif page == "Koopkans":
         "Inclusief technische metrics en groeiverwachting voor 48u, 1 maand en 3 maanden."
     )
 
-    ms_kk     = market_status()
-    _kk_cls   = "status-open" if ms_kk["is_open"] else ("status-pre" if ms_kk["status"] == "pre-market" else "status-closed")
-    st.markdown(
-        f'<div class="status-bar">'
-        f'<span class="status-live {_kk_cls}"></span>'
-        f'<span style="color:#F1F5F9;font-weight:600;font-size:.88rem">{ms_kk["status"].upper()}</span>'
-        f'<span style="color:var(--text-muted);font-size:.82rem">{ms_kk["msg"]}</span>'
-        f'<span style="color:var(--text-dim);font-size:.75rem">NL {ms_kk["now_nl"].strftime("%H:%M")}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    ms_kk = market_status()
+    _render_status_banner(ms_kk)
 
     with st.spinner("Koopsignalen ophalen..."):
         kk_scan = fetch_scan()
@@ -1885,23 +1933,6 @@ elif page == "Koopkans":
                 _rec  = (_pt_kk or {}).get("recommendation", "—")
                 _na   = (_pt_kk or {}).get("n_analysts", 0)
 
-                def _pct_row(label, pct, target):
-                    if target is None:
-                        return (f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
-                                f'border-bottom:1px solid #1e2436"><span style="font-size:.72rem;color:#64748b">'
-                                f'{label}</span><span style="font-size:.72rem;color:#475569">—</span></div>')
-                    color = "#4ade80" if (pct or 0) >= 0 else "#f87171"
-                    arrow = "▲" if (pct or 0) >= 0 else "▼"
-                    return (
-                        f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                        f'padding:5px 0;border-bottom:1px solid #1e2436">'
-                        f'<span style="font-size:.72rem;color:#64748b">{label}</span>'
-                        f'<span style="font-size:.82rem;color:{color};font-weight:700">'
-                        f'{arrow} {abs(pct or 0):.1f}%'
-                        f'<span style="font-size:.68rem;color:#94a3b8"> (${target:.2f})</span></span>'
-                        f'</div>'
-                    )
-
                 # 48u rij voor de card
                 if _fc:
                     _fc_pct  = _fc["verwachting_pct"]
@@ -1910,19 +1941,7 @@ elif page == "Koopkans":
                 else:
                     _fc_row = _pct_row("48u (technisch)", None, None)
 
-                _risk_html = ""
-                if _beta_kk is not None:
-                    _bars_kk = min(5, max(1, round(abs(_beta_kk) * 2)))
-                    _bar_html_kk = "".join(
-                        f'<span class="risk-bar" style="background:{"#f87171" if i < _bars_kk else "#1e2436"}"></span>'
-                        for i in range(5)
-                    )
-                    _blbl = "Laag" if abs(_beta_kk) < 0.8 else ("Hoog" if abs(_beta_kk) > 1.5 else "Gemiddeld")
-                    _risk_html = (
-                        f'<div style="font-size:.7rem;color:#64748b;margin-top:8px">Risico (Beta {_beta_kk:.1f})</div>'
-                        f'<div style="margin-top:2px">{_bar_html_kk} '
-                        f'<span style="font-size:.7rem;color:#94a3b8">{_blbl}</span></div>'
-                    )
+                _risk_html = _render_risk_bar(_beta_kk)
 
                 trend_ok_kk = (sma200 is None) or (price > sma200)
                 trend_html  = (
@@ -2037,18 +2056,8 @@ elif page == "Koopkans":
 elif page == "Markt Scan":
     st.markdown("## Markt Scan")
 
-    _ms_scan   = market_status()
-    _ms_cls    = "status-open" if _ms_scan["is_open"] else ("status-pre" if _ms_scan["status"] == "pre-market" else "status-closed")
-    _ms_label  = _ms_scan["status"].upper()
-    st.markdown(
-        f'<div class="status-bar">'
-        f'<span class="status-live {_ms_cls}"></span>'
-        f'<span style="color:#F1F5F9;font-weight:600;font-size:.88rem">{_ms_label}</span>'
-        f'<span style="color:var(--text-muted);font-size:.82rem">{_ms_scan["msg"]}</span>'
-        f'<span style="color:var(--text-dim);font-size:.75rem">NL {_ms_scan["now_nl"].strftime("%H:%M")}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    _ms_scan = market_status()
+    _render_status_banner(_ms_scan)
 
     _compact = st.toggle("Compacte weergave", value=True, key="scan_compact")
 
@@ -2069,17 +2078,6 @@ elif page == "Markt Scan":
             f'&ensp;·&ensp;{len(scan_results)} tickers gescand</div>',
             unsafe_allow_html=True,
         )
-
-        def _sig_html(signal: str, vol_surge: bool) -> str:
-            surge = '&thinsp;<span style="color:#F59E0B;font-size:.65rem">⚡</span>' if vol_surge else ""
-            cls_map = {"BUY": "sig-buy", "STRONG BUY": "sig-strong", "SELL": "sig-sell"}
-            cls = cls_map.get(signal, "sig-hold")
-            return f'<span class="{cls}">{signal}{surge}</span>'
-
-        def _trend_html(trend_ok: bool) -> str:
-            if trend_ok:
-                return '<span style="color:var(--profit);font-weight:700">↑</span>'
-            return '<span style="color:var(--loss)">↓</span>'
 
         if _compact:
             # ── Compacte HTML tabel met sparklines ───────────────────────
@@ -2188,17 +2186,8 @@ elif page == "Investeer Advies":
     )
 
     # ── Marktstatus banner ────────────────────────────────────────────────────
-    ms      = market_status()
-    _ia_cls = "status-open" if ms["is_open"] else ("status-pre" if ms["status"] == "pre-market" else "status-closed")
-    st.markdown(
-        f'<div class="status-bar">'
-        f'<span class="status-live {_ia_cls}"></span>'
-        f'<span style="color:#F1F5F9;font-weight:600;font-size:.88rem">{ms["status"].upper()}</span>'
-        f'<span style="color:var(--text-muted);font-size:.82rem">{ms["msg"]}</span>'
-        f'<span style="color:var(--text-dim);font-size:.75rem">NL {ms["now_nl"].strftime("%H:%M")}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    ms = market_status()
+    _render_status_banner(ms)
 
     # ── EUR/USD koers ─────────────────────────────────────────────────────────
     eur_usd = fetch_eur_usd()
