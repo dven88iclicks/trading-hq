@@ -51,7 +51,7 @@ ADVICE_FILE         = Path("advice_log.json")
 LAST_SIGNALS_FILE   = Path("last_signals.json")
 SETTINGS_FILE       = Path("settings.json")
 SESSIONS_FILE       = Path("sessions.json")
-SCAN_INTERVAL       = 15 * 60  # seconds
+SCAN_INTERVAL       = 7 * 24 * 60 * 60  # 1x per week (in seconden)
 ALERT_COOLDOWN_H    = 6        # minimaal 6 uur tussen dezelfde alert per ticker
 SESSION_TIMEOUT_MIN = 10       # automatisch uitloggen na X minuten inactiviteit
 
