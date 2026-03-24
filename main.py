@@ -686,7 +686,7 @@ def telegram_send(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     settings = load_settings()
-    if not settings.get("telegram_enabled", True):
+    if not settings.get("telegram_enabled", False):
         return False
     try:
         r = requests.post(
