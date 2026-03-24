@@ -685,6 +685,9 @@ def _get_volume(data: pd.DataFrame, ticker: str, multi: bool) -> pd.Series:
 def telegram_send(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
+    settings = load_settings()
+    if not settings.get("telegram_enabled", True):
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -2619,6 +2622,26 @@ elif page == "Transacties":
                 st.success("Wachtwoord opgeslagen. Je wordt uitgelogd — log opnieuw in.")
                 st.session_state.authenticated = False
                 st.rerun()
+
+    st.divider()
+
+    # ── Telegram notificaties aan/uit ─────────────────────────────────────────
+    st.markdown("### Telegram Notificaties")
+    _cfg = load_settings()
+    _tg_enabled = _cfg.get("telegram_enabled", True)
+    _tg_toggle = st.toggle(
+        "Telegram notificaties ingeschakeld",
+        value=_tg_enabled,
+        help="Schakel uit om alle automatische Telegram-berichten te stoppen.",
+    )
+    if _tg_toggle != _tg_enabled:
+        _cfg["telegram_enabled"] = _tg_toggle
+        save_settings(_cfg)
+        if _tg_toggle:
+            st.success("✓ Telegram notificaties ingeschakeld.")
+        else:
+            st.success("✓ Telegram notificaties uitgeschakeld.")
+        st.rerun()
 
     st.divider()
 
